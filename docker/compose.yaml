@@ -1,0 +1,119 @@
+# A full runthrough of the upgrade shape pgs3 exists for:
+#
+#   primary --archive--> [archive volume] --> pgs3 --pgoutput--> replica
+#
+# The two networks are the point. pgs3 sits only on `downstream`, so it has no
+# route to the primary at all: the replica's catch-up provably comes from
+# archived WAL rather than from a live connection to the source.
+#
+#   docker compose -f docker/compose.yaml up --build \
+#     --abort-on-container-exit --exit-code-from demo
+
+name: pgs3-demo
+
+x-postgres: &postgres
+  image: postgres:18
+  environment:
+    POSTGRES_PASSWORD: postgres
+    POSTGRES_HOST_AUTH_METHOD: trust
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U postgres"]
+    interval: 1s
+    timeout: 3s
+    retries: 30
+
+services:
+  # Gives postgres ownership of the shared volumes before anything starts.
+  init:
+    image: postgres:18
+    user: root
+    command: >-
+      sh -c "mkdir -p /archive /state &&
+             chown -R postgres:postgres /archive /state &&
+             echo 'init: archive and state ready'"
+    volumes:
+      - archive:/archive
+      - state:/state
+
+  primary:
+    <<: *postgres
+    depends_on:
+      init: {condition: service_completed_successfully}
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+      - -c
+      - wal_compression=pglz
+      - -c
+      - archive_mode=on
+      # The archive is the only thing pgs3 ever reads.
+      - -c
+      - archive_command=test ! -f /archive/%f && cp %p /archive/%f
+      # Roll a segment even when idle, so the archive keeps up with the demo.
+      - -c
+      - archive_timeout=10s
+    volumes:
+      - archive:/archive
+    networks: [upstream]
+
+  # Stands in for the freshly-upgraded replica.
+  replica:
+    <<: *postgres
+    depends_on:
+      init: {condition: service_completed_successfully}
+    command:
+      - postgres
+      - -c
+      - max_logical_replication_workers=8
+      - -c
+      - max_worker_processes=16
+    # On both networks: it subscribes to the primary first to establish T0,
+    # then is repointed at pgs3.
+    networks: [upstream, downstream]
+    ports:
+      - "55433:5432"
+
+  pgs3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      init: {condition: service_completed_successfully}
+    volumes:
+      - archive:/archive:ro
+      - state:/state
+    # Only `downstream`. There is no route from here to the primary.
+    networks: [downstream]
+    ports:
+      - "55439:5439"
+    restart: on-failure
+
+  demo:
+    image: postgres:18
+    depends_on:
+      primary: {condition: service_healthy}
+      replica: {condition: service_healthy}
+    environment:
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    volumes:
+      - state:/state
+      - archive:/archive:ro
+      - ./demo.sh:/demo.sh:ro
+      - ../sql:/sql:ro
+      - ../scripts:/scripts:ro
+    entrypoint: ["/bin/bash", "/demo.sh"]
+    networks: [upstream, downstream]
+
+networks:
+  upstream:
+  downstream:
+
+volumes:
+  archive:
+  state:
