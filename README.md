@@ -95,89 +95,27 @@ mis-encoded.
 
 ## Using it
 
-```sh
-# 1. Once, against the source primary:
-psql -X -t -A -v pubname=p -f sql/dump_catalog.sql > catalog.json
+### Primary
 
-# 2. On the replica box, serving archived WAL. --start must be the slot's
-#    restart_lsn, which is how far back the archive has to reach.
-pgs3 serve --wal /var/lib/wal-cache --catalog catalog.json \
-     --start "$(psql -tAc "select restart_lsn from pg_replication_slots where slot_name='sub'")" \
-     --end   "$(psql -tAc 'select pg_current_wal_lsn()')" \
-     --listen 127.0.0.1:5439 --confirmed-lsn-file /run/pgs3.lsn
+- Get the catalog
+  - `psql -X -t -A -v pubname=p -f sql/dump_catalog.sql > catalog.json`
+- Get the LSN that you want to start from (maybe from catalog or `select pg_current_wal_lsn();`)
 
-# 3. Keep the primary's slot trailing the subscriber, so it retains almost nothing:
-scripts/advance-slot.sh "$PRIMARY_CONNINFO" sub /run/pgs3.lsn 10
+### PGS3 Host
 
-# 4. Point the existing subscription at pgs3, let it catch up, then cut back:
-psql -c "alter subscription sub connection 'host=127.0.0.1 port=5439'"
-```
+- Set your WAL S3 dir
+  - `export PGS3_WALG_CONFIG=/etc/wal-g/config.json`
+- Run PGS3
+  - `./pgs3 serve --wal /tml/walcache --catalog catalog.json --start "START_LSN" --end   "FFFFFFFF/FFFFFFFF" --listen 127.0.0.1:5439 --confirmed-lsn-file /run/pgs3.lsn`
+
+### Subscriber
+
+- Create subscription
+  - `psql -c "alter subscription sub connection 'host=127.0.0.1 port=5439'"
+
 
 The subscription must have been created `WITH (binary = true, streaming = off)`;
-`serve` refuses otherwise rather than sending datums the subscriber would
-misread.
 
-## Seeing it work
-
-```sh
-docker compose -f docker/compose.yaml up --build \
-  --abort-on-container-exit --exit-code-from demo
-```
-
-Brings up a Postgres 18 primary, a Postgres 18 replica and pgs3, then walks the
-whole upgrade shape and checks each step:
-
-```
-== 6. repoint the replica at pgs3
-   ok  caught up: 6 rows
-== 7. did the primary serve any of that?
-   ok  slot still inactive, zero replication connections on the primary
-== 8. compare the two databases
-   ok  every row identical, including TOAST, jsonb, arrays and numeric
-== 9. advance the primary's slot to what the subscriber confirmed
-   ok  confirmed_flush_lsn = 0/2016198, exactly what the subscriber reported, never beyond
-   ok  restart_lsn still 0/2012D68; it follows at the next checkpoint
-== 10. new writes keep flowing, and the primary finally releases WAL
-   ok  pgs3 followed the archive; the row arrived without the primary being read
-   ok  restart_lsn 0/2012D68 -> 0/3000048, releasing 16 MB of WAL
-```
-
-Two details in `docker/compose.yaml` carry the argument:
-
-- The primary's `archive_command` copies WAL to a volume that pgs3 mounts
-  read-only. That archive is the *only* thing pgs3 reads.
-- pgs3 sits on the `downstream` network; the primary is on `upstream`. There is
-  no route between them, so "the catch-up did not come from the primary" is
-  enforced by the topology rather than asserted. The demo also checks it from
-  the primary's side: the slot stays inactive and `pg_stat_replication` stays
-  empty throughout.
-
-## Verifying
-
-```sh
-./scripts/check.sh
-```
-
-`scripts/check-all.sh` runs the same thing against every Postgres major in the
-nix store.
-
-Each run builds a throwaway cluster, runs a workload that exercises every decode
-path, and checks against Postgres itself:
-
-- **framing** — every record matches `pg_waldump` on lsn, rmgr, xid and `xl_tot_len`
-- **decoding** — every change matches `test_decoding` consuming the same WAL,
-  compared value-for-value
-- **encoding** — the pgoutput byte stream is diffed message-for-message against
-  `pg_logical_slot_peek_binary_changes` using Postgres' own pgoutput plugin
-- **end to end** — a second cluster subscribes to pgs3 and catches up **with the
-  primary stopped**, then its table contents are compared against the primary's
-- **guards** — the DDL, wrong-archive and unencodable-type refusals all fire
-
-Both TOAST paths are checked byte-exact: a 9600-byte external value stitched
-from five chunks, and a 16000-byte pglz-compressed value. The workload
-deliberately populates a table, checkpoints, then updates it, so that records
-carrying *both* a compressed full-page image and tuple data are decoded — the
-case where a mis-sized image header silently corrupts the row.
 
 ## Deliberate limits
 
@@ -192,9 +130,12 @@ case where a mis-sized image header silently corrupts the row.
 - **pglz only.** `lz4`/`zstd` TOAST and `wal_compression` need their codecs.
 - **Transactions buffer in memory.** Spill to disk before a bulk UPDATE of a wide
   table meets a small instance.
-- **Segments come from a directory.** S3 lands behind `SegmentDir` by shelling
-  out to `wal-g wal-fetch`. A segment that is not there yet is treated as "not
-  archived yet" and retried, which is what lets `serve` follow a live archive.
+- **Segments come from a directory**, used as a cache. If a segment is missing
+  from it and `WALG_S3_PREFIX` is set, `SegmentDir` shells out to
+  `wal-g wal-fetch` before giving up; wal-g reads the rest of its S3 config
+  (creds, region, etc.) from the environment. Either way, a segment that
+  isn't available yet is treated as "not archived yet" and retried, which is
+  what lets `serve` follow a live archive.
 - **One connection at a time.** A subscriber needs exactly one, and reconnects
   are handled, but a client that connects and stays silent is dropped after a
   10s handshake timeout rather than holding the listener shut.

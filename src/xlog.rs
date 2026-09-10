@@ -103,9 +103,11 @@ impl std::fmt::Display for SegmentUnavailable {
 
 impl std::error::Error for SegmentUnavailable {}
 
-/// Where segments come from. v0 reads a directory; S3 lands behind the same
-/// call by shelling out to `wal-g wal-fetch` into a cache dir.
-// ponytail: directory only. Add an S3 source when the local path works end to end.
+/// Where segments come from. `dir` is a local cache; if a segment is missing
+/// from it and wal-g is configured (`WALG_S3_PREFIX` and/or `PGS3_WALG_CONFIG`
+/// set), it is fetched with `wal-g wal-fetch` before falling back to "not
+/// archived yet". Everything about the bucket itself — creds, prefix, region
+/// — comes from wal-g's own config, whether that's env vars or a config file.
 pub struct SegmentDir {
     dir: PathBuf,
     cache: HashMap<u64, Vec<u8>>,
@@ -116,15 +118,39 @@ impl SegmentDir {
         Self { dir: dir.as_ref().to_path_buf(), cache: HashMap::new() }
     }
 
+    /// `wal-g [--config <path>] wal-fetch <segment> <dest>`. Returns Ok(false)
+    /// rather than an error when wal-g exits nonzero: that means "not archived
+    /// yet", the same as a missing file, and the caller retries instead of
+    /// aborting.
+    fn walg_fetch(&self, name: &str, dest: &Path) -> Result<bool> {
+        let config = std::env::var("PGS3_WALG_CONFIG").ok();
+        if config.is_none() && std::env::var_os("WALG_S3_PREFIX").is_none() {
+            return Ok(false);
+        }
+        let walg = std::env::var("PGS3_WALG_BIN").unwrap_or_else(|_| "wal-g".into());
+        let mut cmd = std::process::Command::new(&walg);
+        if let Some(path) = &config {
+            cmd.args(["--config", path]);
+        }
+        let status = cmd
+            .args(["wal-fetch", name, dest.to_str().context("--wal path is not valid UTF-8")?])
+            .status()
+            .with_context(|| format!("running `{walg} wal-fetch {name}`"))?;
+        Ok(status.success())
+    }
+
     fn get(&mut self, tli: u32, segno: u64, seg_size: u64) -> Result<&[u8]> {
         if !self.cache.contains_key(&segno) {
             let name = crate::lsn::segment_name(tli, segno, seg_size);
             let path = self.dir.join(&name);
+            if !path.exists() && !self.walg_fetch(&name, &path)? {
+                // Not on disk and wal-g couldn't get it either: treat exactly
+                // like a missing file below, since we only ever read forward.
+                return Err(anyhow::Error::new(SegmentUnavailable(name)));
+            }
             let bytes = match std::fs::read(&path) {
                 Ok(b) => b,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // We only ever read forward, so a missing segment is always
-                    // the next one: not yet archived rather than a gap.
                     return Err(anyhow::Error::new(SegmentUnavailable(name)));
                 }
                 Err(e) => {
