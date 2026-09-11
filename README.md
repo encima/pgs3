@@ -110,19 +110,36 @@ mis-encoded.
 
 ### Subscriber
 
-- Create subscription 
+The subscription is created against the **primary**, not against `pgs3`, and
+that is the same T0 the dictionary is captured at. Creating it there is what
+fills `pg_subscription_rel`, and the apply worker only applies changes for
+relations listed in it.
+
 ```sql
 CREATE SUBSCRIPTION sub
-  CONNECTION 'host=127.0.0.1 port=5439 dbname=yourdb'
+  CONNECTION 'host=primary dbname=yourdb'
   PUBLICATION pub
-  WITH (connect = false, create_slot = false, slot_name = 'sub',
-        copy_data = false, binary = true, streaming = off);
+  WITH (binary = true, streaming = off, copy_data = false, slot_name = 'sub');
 ```
 
-- Enable subscription
+Then the upgrade window opens. Disable it, take the slot's `restart_lsn` as
+`--start`, and repoint it at `pgs3` once the replica is back.
+
 ```sql
+ALTER SUBSCRIPTION sub DISABLE;
+-- ... the upgrade ...
+ALTER SUBSCRIPTION sub CONNECTION 'host=127.0.0.1 port=5439 dbname=yourdb';
 ALTER SUBSCRIPTION sub ENABLE;
 ```
+
+Creating the subscription against `pgs3` directly with `connect = false` looks
+shorter and is a trap. It leaves `pg_subscription_rel` empty, and the only way
+to fill it afterwards is `ALTER SUBSCRIPTION ... REFRESH PUBLICATION`, which
+`pgs3` cannot answer: it speaks `IDENTIFY_SYSTEM` and `START_REPLICATION`, not
+SQL. The failure is silent — the apply worker starts, `received_lsn` advances,
+the subscriber even confirms the LSN, and every change is discarded. The
+signature is `pg_replication_origin_status.remote_lsn` stuck at `0/0` while
+rows never arrive.
 
 
 ## Deliberate limits
@@ -143,7 +160,10 @@ ALTER SUBSCRIPTION sub ENABLE;
   `wal-g wal-fetch` before giving up; wal-g reads the rest of its S3 config
   (creds, region, etc.) from the environment. Either way, a segment that
   isn't available yet is treated as "not archived yet" and retried, which is
-  what lets `serve` follow a live archive.
+  what lets `serve` follow a live archive. Repeat misses on the *same* segment
+  back off from 1s to 30s, so waiting at the head of the archive costs a couple
+  of `wal-g` invocations a minute rather than one per poll; any other segment is
+  fetched immediately, so catch-up still reads at full speed.
 - **One connection at a time.** A subscriber needs exactly one, and reconnects
   are handled, but a client that connects and stays silent is dropped after a
   10s handshake timeout rather than holding the listener shut.

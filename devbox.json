@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.17.5/.schema/devbox.schema.json",
+  "packages": {
+    "wal-g":        "latest",
+    "minio-client": "latest",
+    "minio": {
+      "version":        "latest",
+      "allow_insecure": ["minio-2025-10-15T17-29-55Z"]
+    },
+    "cargo": "latest",
+    "rustc": "latest"
+  },
+  "shell": {
+    "scripts": {
+      "demo-up":     ["scripts/minio-demo.sh up"],
+      "demo-down":   ["scripts/minio-demo.sh down"],
+      "demo-status": ["scripts/minio-demo.sh status"]
+    }
+  }
+}

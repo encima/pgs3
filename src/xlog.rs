@@ -8,6 +8,7 @@ use crate::version::PgVersion;
 use anyhow::{bail, ensure, Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const SIZE_OF_XLOG_RECORD: u64 = 24;
 const SIZE_OF_XLOG_SHORT_PHD: u64 = 24;
@@ -111,20 +112,55 @@ impl std::error::Error for SegmentUnavailable {}
 pub struct SegmentDir {
     dir: PathBuf,
     cache: HashMap<u64, Vec<u8>>,
+    /// The segment wal-g last failed to fetch, when that was, and how long to
+    /// wait before asking for it again.
+    last_miss: Option<(String, Instant, Duration)>,
+}
+
+const FETCH_RETRY_MIN: Duration = Duration::from_secs(1);
+const FETCH_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// Whether to shell out to wal-g again for `name`. Waiting for the next
+/// segment to be archived means being asked for it at the caller's polling
+/// rate — several times a second — and every ask is a wal-g process and a set
+/// of S3 requests. So the wait after a miss doubles up to `FETCH_RETRY_MAX`,
+/// and only for the segment that missed: any other name is a fresh miss and is
+/// fetched immediately, which is what keeps catch-up reading at full speed.
+fn fetch_is_due(last_miss: Option<(&str, Duration, Duration)>, name: &str) -> bool {
+    match last_miss {
+        Some((missed, ago, wait)) => missed != name || ago >= wait,
+        None => true,
+    }
+}
+
+fn next_wait(prev: Option<Duration>) -> Duration {
+    match prev {
+        None => FETCH_RETRY_MIN,
+        Some(w) => (w * 2).min(FETCH_RETRY_MAX),
+    }
 }
 
 impl SegmentDir {
     pub fn new(dir: impl AsRef<Path>) -> Self {
-        Self { dir: dir.as_ref().to_path_buf(), cache: HashMap::new() }
+        Self { dir: dir.as_ref().to_path_buf(), cache: HashMap::new(), last_miss: None }
     }
 
     /// `wal-g [--config <path>] wal-fetch <segment> <dest>`. Returns Ok(false)
     /// rather than an error when wal-g exits nonzero: that means "not archived
     /// yet", the same as a missing file, and the caller retries instead of
-    /// aborting.
-    fn walg_fetch(&self, name: &str, dest: &Path) -> Result<bool> {
+    /// aborting. Repeat asks for a segment that keeps missing are spaced out by
+    /// `fetch_is_due`.
+    fn walg_fetch(&mut self, name: &str, dest: &Path) -> Result<bool> {
         let config = std::env::var("PGS3_WALG_CONFIG").ok();
         if config.is_none() && std::env::var_os("WALG_S3_PREFIX").is_none() {
+            return Ok(false);
+        }
+        let due = {
+            let last =
+                self.last_miss.as_ref().map(|(n, at, wait)| (n.as_str(), at.elapsed(), *wait));
+            fetch_is_due(last, name)
+        };
+        if !due {
             return Ok(false);
         }
         let walg = std::env::var("PGS3_WALG_BIN").unwrap_or_else(|_| "wal-g".into());
@@ -136,7 +172,14 @@ impl SegmentDir {
             .args(["wal-fetch", name, dest.to_str().context("--wal path is not valid UTF-8")?])
             .status()
             .with_context(|| format!("running `{walg} wal-fetch {name}`"))?;
-        Ok(status.success())
+        if status.success() {
+            self.last_miss = None;
+            return Ok(true);
+        }
+        let prev =
+            self.last_miss.as_ref().filter(|(n, _, _)| n == name).map(|(_, _, wait)| *wait);
+        self.last_miss = Some((name.to_string(), Instant::now(), next_wait(prev)));
+        Ok(false)
     }
 
     fn get(&mut self, tli: u32, segno: u64, seg_size: u64) -> Result<&[u8]> {
@@ -547,3 +590,30 @@ fn parse_record_body(
     Ok((main_data, blocks, toplevel_xid))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetch_backoff_holds_off_only_the_segment_that_missed() {
+        let seg = "000000010000000000000002";
+        // Never asked for: ask now.
+        assert!(fetch_is_due(None, seg));
+        // Asked 100ms ago, told to wait a second: don't spawn wal-g again.
+        assert!(!fetch_is_due(Some((seg, Duration::from_millis(100), FETCH_RETRY_MIN)), seg));
+        // Wait elapsed: ask again.
+        assert!(fetch_is_due(Some((seg, Duration::from_secs(2), FETCH_RETRY_MIN)), seg));
+        // Another segment is a fresh miss however recent the last one was, so
+        // reading forward through an archive that is already complete never
+        // waits.
+        assert!(fetch_is_due(
+            Some((seg, Duration::from_millis(1), FETCH_RETRY_MAX)),
+            "000000010000000000000003"
+        ));
+        // Doubling, capped.
+        assert_eq!(next_wait(None), FETCH_RETRY_MIN);
+        assert_eq!(next_wait(Some(Duration::from_secs(4))), Duration::from_secs(8));
+        assert_eq!(next_wait(Some(FETCH_RETRY_MAX)), FETCH_RETRY_MAX);
+    }
+}
