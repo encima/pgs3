@@ -110,11 +110,19 @@ mis-encoded.
 
 ### Subscriber
 
-- Create subscription
-  - `psql -c "alter subscription sub connection 'host=127.0.0.1 port=5439'"
+- Create subscription 
+```sql
+CREATE SUBSCRIPTION sub
+  CONNECTION 'host=127.0.0.1 port=5439 dbname=yourdb'
+  PUBLICATION pub
+  WITH (connect = false, create_slot = false, slot_name = 'sub',
+        copy_data = false, binary = true, streaming = off);
+```
 
-
-The subscription must have been created `WITH (binary = true, streaming = off)`;
+- Enable subscription
+```sql
+ALTER SUBSCRIPTION sub ENABLE;
+```
 
 
 ## Deliberate limits
