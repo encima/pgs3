@@ -69,21 +69,18 @@ pub enum HeapOp {
     Update { old: Option<RawTuple>, new: RawTuple },
     Delete { old: Option<RawTuple> },
     MultiInsert { tuples: Vec<RawTuple> },
-    Truncate,
 }
 
 /// Decode a heap/heap2 record. `None` for records that carry no row change.
+/// TRUNCATE registers no block reference, so it never reaches here; see
+/// `parse_truncate`.
 pub fn parse_heap(r: &Record) -> Result<Option<(RelFileLocator, HeapOp)>> {
     let md = &r.main_data;
     let op = r.heap_opcode();
 
     // Every row change registers the target page as block 0.
-    let blk0 = match r.block(0) {
-        Some(b) => b,
-        None if op == XLOG_HEAP_TRUNCATE => {
-            return Ok(None); // truncate carries relids in main data; handled by caller
-        }
-        None => return Ok(None),
+    let Some(blk0) = r.block(0) else {
+        return Ok(None);
     };
     // Only the main fork holds tuples; visibility-map and fsm blocks never do.
     if blk0.forknum != crate::xlog::MAIN_FORKNUM {
@@ -171,10 +168,26 @@ pub fn parse_heap(r: &Record) -> Result<Option<(RelFileLocator, HeapOp)>> {
             )))
         }
 
-        (crate::xlog::RM_HEAP_ID, XLOG_HEAP_TRUNCATE) => Ok(Some((rloc, HeapOp::Truncate))),
-
         _ => Ok(None),
     }
+}
+
+/// `xl_heap_truncate`: the relations live in main data because truncate
+/// registers no block reference. Returns (dbId, relIds).
+pub fn parse_truncate(r: &Record) -> Result<(u32, Vec<u32>)> {
+    let md = &r.main_data;
+    // Oid dbId; Oid tsId; int nrelids; bool cascade; Oid relIds[]
+    ensure!(md.len() >= 16, "truncated xl_heap_truncate at {}", r.lsn);
+    let db = u32::from_le_bytes(md[0..4].try_into()?);
+    let n = i32::from_le_bytes(md[8..12].try_into()?);
+    ensure!(n >= 0, "negative nrelids at {}", r.lsn);
+    let n = n as usize;
+    ensure!(md.len() >= 16 + 4 * n, "truncated relid list at {}", r.lsn);
+    let mut relids = Vec::with_capacity(n);
+    for i in 0..n {
+        relids.push(u32::from_le_bytes(md[16 + 4 * i..20 + 4 * i].try_into()?));
+    }
+    Ok((db, relids))
 }
 
 /// Tuple images carried by a record, read without consulting the logical-decoding
@@ -192,9 +205,18 @@ pub fn raw_tuples(r: &Record) -> Result<Vec<RawTuple>> {
         return Ok(Vec::new());
     }
     Ok(match (r.rmid, r.heap_opcode()) {
-        (crate::xlog::RM_HEAP_ID, XLOG_HEAP_INSERT)
-        | (crate::xlog::RM_HEAP_ID, XLOG_HEAP_UPDATE)
+        (crate::xlog::RM_HEAP_ID, XLOG_HEAP_INSERT) => vec![RawTuple::parse(&blk0.data)?],
+        (crate::xlog::RM_HEAP_ID, XLOG_HEAP_UPDATE)
         | (crate::xlog::RM_HEAP_ID, XLOG_HEAP_HOT_UPDATE) => {
+            // Delta-compressed updates carry one or two uint16 lengths before
+            // a tuple image stripped of its unchanged parts. The leading Oid
+            // is exactly what gets stripped, so the bytes cannot be read as a
+            // tuple header -- report nothing rather than misparse them.
+            let md = &r.main_data;
+            ensure!(md.len() >= 8, "truncated xl_heap_update at {}", r.lsn);
+            if md[7] & (XLH_UPDATE_PREFIX_FROM_OLD | XLH_UPDATE_SUFFIX_FROM_OLD) != 0 {
+                return Ok(Vec::new());
+            }
             vec![RawTuple::parse(&blk0.data)?]
         }
         (crate::xlog::RM_HEAP2_ID, XLOG_HEAP2_MULTI_INSERT) => {
@@ -257,7 +279,9 @@ pub fn parse_xact(r: &Record) -> Result<XactInfo> {
     }
     if info.xinfo & XACT_XINFO_HAS_SUBXACTS != 0 {
         ensure!(md.len() >= p + 4, "truncated subxact count at {}", r.lsn);
-        let n = i32::from_le_bytes(md[p..p + 4].try_into()?) as usize;
+        let n = i32::from_le_bytes(md[p..p + 4].try_into()?);
+        ensure!(n >= 0, "negative subxact count at {}", r.lsn);
+        let n = n as usize;
         p += 4;
         ensure!(md.len() >= p + 4 * n, "truncated subxact list at {}", r.lsn);
         for i in 0..n {
@@ -273,12 +297,53 @@ pub fn parse_assignment(r: &Record) -> Result<(u32, Vec<u32>)> {
     let md = &r.main_data;
     ensure!(md.len() >= 8, "truncated xl_xact_assignment at {}", r.lsn);
     let top = u32::from_le_bytes(md[0..4].try_into()?);
-    let n = i32::from_le_bytes(md[4..8].try_into()?) as usize;
+    let n = i32::from_le_bytes(md[4..8].try_into()?);
+    ensure!(n >= 0, "negative subxact count at {}", r.lsn);
+    let n = n as usize;
+    // Bound the allocation by the bytes actually present before trusting n.
+    ensure!(md.len() >= 8 + 4 * n, "truncated assignment list at {}", r.lsn);
     let mut subs = Vec::with_capacity(n);
     for i in 0..n {
         let o = 8 + 4 * i;
-        ensure!(md.len() >= o + 4, "truncated assignment list at {}", r.lsn);
         subs.push(u32::from_le_bytes(md[o..o + 4].try_into()?));
     }
     Ok((top, subs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsn::Lsn;
+    use crate::xlog::{Record, RM_HEAP_ID, RM_XACT_ID};
+
+    fn rec(rmid: u8, info: u8, main_data: Vec<u8>) -> Record {
+        Record {
+            lsn: Lsn(0), end_lsn: Lsn(0), tot_len: 0, xid: 1, rmid, info,
+            main_data, blocks: Vec::new(), toplevel_xid: None,
+        }
+    }
+
+    #[test]
+    fn truncate_relids_come_from_main_data() {
+        let mut md = Vec::new();
+        md.extend_from_slice(&999u32.to_le_bytes());
+        md.extend_from_slice(&0u32.to_le_bytes());
+        md.extend_from_slice(&2i32.to_le_bytes());
+        md.resize(16, 0);
+        md.extend_from_slice(&16384u32.to_le_bytes());
+        md.extend_from_slice(&16385u32.to_le_bytes());
+        let (db, relids) = parse_truncate(&rec(RM_HEAP_ID, XLOG_HEAP_TRUNCATE, md)).unwrap();
+        assert_eq!((db, relids), (999, vec![16384, 16385]));
+        // A negative count is an error, not a huge allocation.
+        let mut bad = vec![0u8; 16];
+        bad[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+        assert!(parse_truncate(&rec(RM_HEAP_ID, XLOG_HEAP_TRUNCATE, bad)).is_err());
+    }
+
+    #[test]
+    fn assignment_rejects_a_negative_subxact_count() {
+        let mut md = vec![0u8; 8];
+        md[4..8].copy_from_slice(&(-1i32).to_le_bytes());
+        assert!(parse_assignment(&rec(RM_XACT_ID, XLOG_XACT_ASSIGNMENT, md)).is_err());
+    }
 }

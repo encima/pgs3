@@ -68,18 +68,18 @@ Input half — done and verified:
 | | |
 |---|---|
 | Segment reader | page headers, contrecords, CRC, block references |
-| Records | heap INSERT/UPDATE/HOT_UPDATE/DELETE/TRUNCATE, heap2 MULTI_INSERT, xact COMMIT/ABORT/ASSIGNMENT |
+| Records | heap INSERT/UPDATE/HOT_UPDATE/DELETE, heap2 MULTI_INSERT, xact COMMIT/ABORT/ASSIGNMENT |
 | Tuples | null bitmaps, alignment, varlena short/long/compressed, pglz |
 | Values | `numeric` and `jsonb` unpacking, arrays incl. multi-dimensional, empty and null-containing |
 | TOAST | chunk collection and reassembly, including unchanged-value detection |
-| Reorder | per-xid buffering, subtransaction folding, commit ordering, aborted xacts dropped |
+| Reorder | per-xid buffering, subtransactions merged at commit, commit ordering, rolled-back xacts and savepoints dropped |
 | Guard | refuses on DDL against a published relation after T0, on an archive from another cluster, and on WAL written below `wal_level=logical` |
 
 Output half — done and verified:
 
 | | |
 |---|---|
-| pgoutput | Begin/Commit/Relation/Insert/Update/Delete/Truncate, binary datums, byte-identical to Postgres' own plugin |
+| pgoutput | Begin/Commit/Relation/Insert/Update/Delete, binary datums, byte-identical to Postgres' own plugin |
 | Walsender | startup, `IDENTIFY_SYSTEM`, `START_REPLICATION`, CopyBoth, `w`/`k` out, `r` in |
 | Resume | reads from `restart_lsn`, suppresses transactions the subscriber already applied |
 | Advancer | `scripts/advance-slot.sh`, driven by the confirmed-LSN file |
@@ -93,20 +93,44 @@ Not implemented: streaming of in-progress transactions, two-phase commit, and
 composite/range/geometric types. Each is refused explicitly rather than
 mis-encoded.
 
+## Building and testing
+
+```
+cargo build --release      # binary at target/release/pgs3
+cargo test                 # unit tests, no Postgres needed
+```
+
+End-to-end checks need a real Postgres in `PATH` (`initdb`, `pg_ctl`, `psql`):
+`scripts/check.sh` builds a throwaway cluster and diffs `pgs3` against Postgres'
+own logical decoding; `scripts/check-all.sh` runs it for every major in the nix
+store. `devbox.json` provides the toolchain plus wal-g/minio for
+`scripts/minio-demo.sh`.
+
 ## Using it
 
 ### Primary
 
-- Get the catalog
+- One-shot bootstrap: capture the dictionary at T0 **and** copy the schema to
+  the target (needs `psql` and `pg_dump` in `PATH`):
+  - `./pgs3 init --source 'host=primary dbname=yourdb' --target 'host=replica dbname=yourdb' --catalog catalog.json [--publication p]`
+  - The dictionary is validated before the target is touched; from T0 on, no DDL
+    (and no TRUNCATE) on published tables.
+- Or capture just the dictionary by hand:
   - `psql -X -t -A -v pubname=p -f sql/dump_catalog.sql > catalog.json`
 - Get the LSN that you want to start from (maybe from catalog or `select pg_current_wal_lsn();`)
 
 ### PGS3 Host
 
-- Set your WAL S3 dir
-  - `export PGS3_WALG_CONFIG=/etc/wal-g/config.json`
+- Tell pgs3 how to fetch missing segments from the archive, either way:
+  - any archive tool, PostgreSQL-style (`%f` = segment name, `%p` = local
+    destination path):
+    - `--restore-command 'pgbackrest --stanza=main archive-get %f %p'` (or
+      `export PGS3_RESTORE_COMMAND='wal-g wal-fetch %f %p'`, barman, `aws s3 cp`,
+      `cp` from NFS — whatever restores one segment)
+  - or wal-g's own env config, which is the implicit default fetcher:
+    - `export PGS3_WALG_CONFIG=/etc/wal-g/config.json`
 - Run PGS3
-  - `./pgs3 serve --wal /tml/walcache --catalog catalog.json --start "START_LSN" --end   "FFFFFFFF/FFFFFFFF" --listen 127.0.0.1:5439 --confirmed-lsn-file /run/pgs3.lsn`
+  - `./pgs3 serve --wal /tmp/walcache --catalog catalog.json --start "START_LSN" --end   "FFFFFFFF/FFFFFFFF" --listen 127.0.0.1:5439 --confirmed-lsn-file /run/pgs3.lsn`
 
 ### Subscriber
 
@@ -149,6 +173,10 @@ rows never arrive.
   byteswap; `numeric` is a repacking; `jsonb` needs a full `jsonb_out` (its
   binary form *is* the text rendering), which is why `numeric_out` is in here
   too. Composite, range and geometric types are still refused.
+- **TRUNCATE of a published table stops the stream.** Truncate assigns a new
+  relfilenode — to the table and its TOAST — which the frozen dictionary cannot
+  follow; rows written afterwards would be silently dropped. The decoder
+  refuses instead. Re-capture the dictionary at a new T0 afterwards.
 - **`decode` mode's text output** covers a smaller allowlist and prints tagged
   hex otherwise. It exists to be diffed against `test_decoding`, not to be
   consumed.
@@ -156,13 +184,18 @@ rows never arrive.
 - **Transactions buffer in memory.** Spill to disk before a bulk UPDATE of a wide
   table meets a small instance.
 - **Segments come from a directory**, used as a cache. If a segment is missing
-  from it and `WALG_S3_PREFIX` is set, `SegmentDir` shells out to
-  `wal-g wal-fetch` before giving up; wal-g reads the rest of its S3 config
-  (creds, region, etc.) from the environment. Either way, a segment that
+  from it, an archive fetcher runs before giving up: `--restore-command` (or
+  `PGS3_RESTORE_COMMAND`) is a PostgreSQL-style template — any shell command
+  where `%f` is the segment name and `%p` the local destination — so
+  `wal-g wal-fetch %f %p`, `pgbackrest --stanza=main archive-get %f %p`,
+  `barman-wal-restore`, or `cp /mnt/nfs/%f %p` all work; the tool itself owns
+  creds, layout, compression and encryption. Without one, `SegmentDir` falls
+  back to `wal-g wal-fetch` when `WALG_S3_PREFIX`/`PGS3_WALG_CONFIG` are set.
+  Either way, a segment that
   isn't available yet is treated as "not archived yet" and retried, which is
   what lets `serve` follow a live archive. Repeat misses on the *same* segment
   back off from 1s to 30s, so waiting at the head of the archive costs a couple
-  of `wal-g` invocations a minute rather than one per poll; any other segment is
+  of fetcher invocations a minute rather than one per poll; any other segment is
   fetched immediately, so catch-up still reads at full speed.
 - **One connection at a time.** A subscriber needs exactly one, and reconnects
   are handled, but a client that connects and stays silent is dropped after a

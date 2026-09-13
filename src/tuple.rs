@@ -102,10 +102,14 @@ fn varsize_any(p: &[u8]) -> Result<usize> {
 }
 
 /// Decode one varlena to its payload, decompressing inline-compressed values
-/// and surfacing external pointers for the reorder buffer to stitch.
+/// and surfacing external pointers for the reorder buffer to stitch. Called
+/// before `varsize_any`, so every slice needs its own bound: the tuple bytes
+/// come from WAL, where zeros are the most common corruption pattern.
 fn decode_varlena(p: &[u8]) -> Result<Datum> {
+    ensure!(!p.is_empty(), "varlena read past end of tuple");
     let h = p[0];
     if h == 0x01 {
+        ensure!(p.len() >= 18, "truncated external TOAST pointer");
         ensure!(p[1] == VARTAG_ONDISK, "unexpected vartag {} in WAL", p[1]);
         let b = &p[2..18];
         let raw_size = i32::from_le_bytes(b[0..4].try_into()?);
@@ -125,12 +129,16 @@ fn decode_varlena(p: &[u8]) -> Result<Datum> {
     if h & 0x01 == 0x01 {
         // Short header: never compressed, never external.
         let total = (h >> 1) as usize & 0x7F;
+        ensure!(p.len() >= total, "short-header varlena claims {total} bytes, {} present", p.len());
         return Ok(Datum::Var(p[1..total].to_vec()));
     }
+    ensure!(p.len() >= 4, "truncated 4-byte varlena header");
     let w = u32::from_le_bytes(p[0..4].try_into()?);
     let total = ((w >> 2) & 0x3FFF_FFFF) as usize;
+    ensure!(total >= 4 && p.len() >= total, "varlena claims {total} bytes, {} present", p.len());
     if w & 0x03 == 0x02 {
         // Compressed inline: 4-byte header, then va_tcinfo, then the stream.
+        ensure!(total >= 8, "compressed varlena too short for its header");
         let tcinfo = u32::from_le_bytes(p[4..8].try_into()?);
         let raw = (tcinfo & VARLENA_EXTSIZE_MASK) as usize;
         let method = (tcinfo >> VARLENA_EXTSIZE_BITS) as u8;
@@ -326,5 +334,18 @@ mod tests {
         // Claim 5 attributes against a 1-column catalog: schema drifted.
         let err = deform(&b, im, 5, hoff, &[INT4]).unwrap_err().to_string();
         assert!(err.contains("schema changed after T0"), "got: {err}");
+    }
+
+    #[test]
+    fn zeroed_varlena_is_an_error_not_a_panic() {
+        // Four zero bytes: 4-byte header claiming a total size of 0.
+        let (b, im, im2, hoff) = tuple(1, None, &[0, 0, 0, 0]);
+        assert!(deform(&b, im, im2, hoff, &[TEXT]).is_err());
+        // Short header claiming 15 bytes when one is present.
+        let (b, im, im2, hoff) = tuple(1, None, &[0x1F]);
+        assert!(deform(&b, im, im2, hoff, &[TEXT]).is_err());
+        // Truncated external pointer.
+        let (b, im, im2, hoff) = tuple(1, None, &[0x01, VARTAG_ONDISK, 0, 0]);
+        assert!(deform(&b, im, im2, hoff, &[TEXT]).is_err());
     }
 }

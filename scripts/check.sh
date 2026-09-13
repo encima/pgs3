@@ -100,6 +100,16 @@ copy t (id,name,amount) from stdin with (format csv);
 -- First touch of the pre-checkpoint pages: these records carry a compressed
 -- full-page image *and* tuple data, so a mis-sized image header corrupts the row.
 update t set name = name || '!' where id between 100 and 300;
+-- a rolled-back savepoint: its insert must not be replicated, while the
+-- surrounding transaction's inserts must be (PG14+ tags the subxact's first
+-- record with the top-level xid, which must not be taken as attribution).
+begin;
+insert into t values (7,'gina',null,7.77,true,null,null,null,null,null,null,null);
+savepoint s1;
+insert into t values (8,'ghost-sub',null,8.88,false,null,null,null,null,null,null,null,null);
+rollback to savepoint s1;
+insert into t values (9,'survivor',null,9.99,true,null,null,null,null,null,null,null,null);
+commit;
 EOF
 psql_ -c "select pg_switch_wal();" >/dev/null
 END=$(psql_ -c 'select pg_current_wal_lsn();')
@@ -212,3 +222,20 @@ grep -q "published relation public.d" <<<"$OUT" \
 grep -q "id\[int4\]:1"          <<<"$OUT" || fail "did not emit the change preceding the DDL"
 ! grep -q "'after'"             <<<"$OUT" || fail "decoded a row written after the schema changed"
 echo "    OK: emitted the pre-DDL change, then refused at the ALTER's commit"
+
+echo "==> truncate of a published table is refused"
+# TRUNCATE assigns a new relfilenode that the frozen dictionary cannot follow,
+# so the decoder must stop rather than silently drop the rows written after.
+psql_ -c "create table tr(id int primary key); create publication ptr for table tr;" >/dev/null
+psql_ -v pubname=ptr -f "$ROOT/sql/dump_catalog.sql" > "$PGD/catalog_tr.json"
+TSTART=$(psql_ -c 'select pg_current_wal_lsn();')
+psql_ -c "insert into tr values (1); truncate tr;" >/dev/null
+psql_ -c "select pg_switch_wal();" >/dev/null
+TEND=$(psql_ -c 'select pg_current_wal_lsn();')
+set +e
+OUT=$("$ROOT/target/debug/pgs3" decode --wal "$PGD/pg_wal" --catalog "$PGD/catalog_tr.json" \
+      --start "$TSTART" --end "$TEND" 2>&1); RC=$?
+set -e
+[ $RC -ne 0 ]                 || fail "decoded across a TRUNCATE of a published table"
+grep -q "public.tr" <<<"$OUT" || { echo "$OUT" | tail -3 | sed 's/^/      /'; fail "stopped, but not on a published-relation guard"; }
+echo "    OK: refused to follow a TRUNCATE"

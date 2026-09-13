@@ -43,11 +43,19 @@ fn u32_at(data: &[u8], at: usize) -> Result<u32> {
 
 pub fn to_text(data: &[u8]) -> Result<String> {
     let mut out = String::new();
-    render_container(data, 0, &mut out)?;
+    render_container(data, 0, 0, &mut out)?;
     Ok(out)
 }
 
-fn render_container(data: &[u8], co: usize, out: &mut String) -> Result<()> {
+/// PG guards container recursion with `check_stack_depth`; a blown stack here
+/// would be a SIGSEGV, not a catchable panic, so cap nesting instead. Real
+/// jsonb never exceeds 100 levels (jsonb_in's own limit).
+const MAX_DEPTH: usize = 100;
+
+fn render_container(data: &[u8], co: usize, depth: usize, out: &mut String) -> Result<()> {
+    if depth > MAX_DEPTH {
+        bail!("jsonb nested more than {MAX_DEPTH} deep");
+    }
     let header = u32_at(data, co)?;
     let count = (header & JB_CMASK) as usize;
     let is_object = header & JB_FOBJECT != 0;
@@ -60,11 +68,16 @@ fn render_container(data: &[u8], co: usize, out: &mut String) -> Result<()> {
 
     // An element's offset is the sum of the lengths behind it, back to the
     // nearest entry that stores an offset outright.
+    // ponytail: O(n·32) walk; real data stores an offset every 32nd entry,
+    // so the inner loop stops there. Only crafted data without HAS_OFF flags
+    // goes quadratic.
     let offset_of = |i: usize| -> Result<usize> {
         let mut off = 0u32;
         for j in (0..i).rev() {
             let c = child(j)?;
-            off += c & JENTRY_OFFLENMASK;
+            off = off
+                .checked_add(c & JENTRY_OFFLENMASK)
+                .ok_or_else(|| anyhow::anyhow!("jsonb entry offsets overflow"))?;
             if c & JENTRY_HAS_OFF != 0 {
                 break;
             }
@@ -98,10 +111,13 @@ fn render_container(data: &[u8], co: usize, out: &mut String) -> Result<()> {
             JENTRY_ISNUMERIC => {
                 // The stored length covers the alignment padding too.
                 let at = align4(start);
+                if at > end {
+                    bail!("jsonb numeric entry {i} is entirely alignment padding");
+                }
                 let n = numeric::parse(varlena_payload(&data[at..end])?)?;
                 out.push_str(&numeric::to_text(&n));
             }
-            JENTRY_ISCONTAINER => render_container(data, align4(start), out)?,
+            JENTRY_ISCONTAINER => render_container(data, align4(start), depth + 1, out)?,
             other => bail!("unknown jsonb entry type {other:#010x}"),
         }
         Ok(())

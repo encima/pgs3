@@ -162,9 +162,6 @@ impl Encoder {
                         b.u8(if rel.relreplident == 'f' { b'O' } else { b'K' });
                         b.bytes(&tuple_data(rel, old)?);
                     }
-                    Kind::Truncate => {
-                        b.u8(b'T').i32(1).u8(0).i32(rel.oid as i32);
-                    }
                 }
                 out.push(b.0);
             }
@@ -341,8 +338,14 @@ pub fn to_send_format(typname: &str, b: &[u8]) -> Result<Vec<u8>> {
     };
     Ok(match typname {
         // Single bytes and opaque byte strings go as-is.
-        "bool" | "char" | "bytea" | "text" | "varchar" | "bpchar" | "name" | "json" | "uuid" => {
+        "bool" | "char" | "bytea" | "text" | "varchar" | "bpchar" | "json" | "uuid" => {
             b.to_vec()
+        }
+        "name" => {
+            // namesend emits strlen bytes; the datum is NUL-padded to 64 and
+            // namerecv rejects anything at or above NAMEDATALEN.
+            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+            b[..end].to_vec()
         }
         "int2" => swap(2)?,
         "int4" | "oid" | "float4" | "date" => swap(4)?,
@@ -407,5 +410,12 @@ mod tests {
         assert_eq!(&w[0..2], &2i16.to_be_bytes());
         assert_eq!(&w[8..10], &10i16.to_be_bytes());
         assert_eq!(&w[10..12], &5000i16.to_be_bytes());
+    }
+
+    #[test]
+    fn name_is_sent_as_strlen_bytes() {
+        let mut disk = b"tbl".to_vec();
+        disk.resize(64, 0); // NUL-padded to NAMEDATALEN on disk
+        assert_eq!(to_send_format("name", &disk).unwrap(), b"tbl");
     }
 }

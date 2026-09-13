@@ -105,25 +105,30 @@ impl std::fmt::Display for SegmentUnavailable {
 impl std::error::Error for SegmentUnavailable {}
 
 /// Where segments come from. `dir` is a local cache; if a segment is missing
-/// from it and wal-g is configured (`WALG_S3_PREFIX` and/or `PGS3_WALG_CONFIG`
-/// set), it is fetched with `wal-g wal-fetch` before falling back to "not
-/// archived yet". Everything about the bucket itself — creds, prefix, region
-/// — comes from wal-g's own config, whether that's env vars or a config file.
+/// from it, an archive fetcher is tried before falling back to "not archived
+/// yet". The fetcher is a `restore_command` in PostgreSQL's sense — any shell
+/// command with `%f` (segment name) and `%p` (local destination) substituted —
+/// so `wal-g wal-fetch`, `pgbackrest archive-get`, `barman-wal-restore` or a
+/// plain `cp` from an NFS archive all work, and the tool itself owns creds,
+/// layout, compression and encryption. Without one, falls back to
+/// `wal-g wal-fetch` when wal-g is configured (`WALG_S3_PREFIX` and/or
+/// `PGS3_WALG_CONFIG` set).
 pub struct SegmentDir {
     dir: PathBuf,
     cache: HashMap<u64, Vec<u8>>,
-    /// The segment wal-g last failed to fetch, when that was, and how long to
-    /// wait before asking for it again.
+    /// The segment the fetcher last failed to fetch, when that was, and how
+    /// long to wait before asking for it again.
     last_miss: Option<(String, Instant, Duration)>,
+    restore_command: Option<String>,
 }
 
 const FETCH_RETRY_MIN: Duration = Duration::from_secs(1);
 const FETCH_RETRY_MAX: Duration = Duration::from_secs(30);
 
-/// Whether to shell out to wal-g again for `name`. Waiting for the next
+/// Whether to shell out to the fetcher again for `name`. Waiting for the next
 /// segment to be archived means being asked for it at the caller's polling
-/// rate — several times a second — and every ask is a wal-g process and a set
-/// of S3 requests. So the wait after a miss doubles up to `FETCH_RETRY_MAX`,
+/// rate — several times a second — and every ask is a fetcher process and a set
+/// of archive requests. So the wait after a miss doubles up to `FETCH_RETRY_MAX`,
 /// and only for the segment that missed: any other name is a fresh miss and is
 /// fetched immediately, which is what keeps catch-up reading at full speed.
 fn fetch_is_due(last_miss: Option<(&str, Duration, Duration)>, name: &str) -> bool {
@@ -140,19 +145,78 @@ fn next_wait(prev: Option<Duration>) -> Duration {
     }
 }
 
+/// POSIX-shell single-quote: wrap in `'…'` and turn each embedded `'` into
+/// `'\''`. Segment names are generated hex (safe), but the destination is an
+/// operator-supplied path that can hold spaces and quotes, so substituted
+/// values are quoted rather than pasted raw into the command line.
+fn sh_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Expand a `restore_command` template the way PostgreSQL does: `%f` is the
+/// segment file name, `%p` the local destination path, `%%` a literal `%`.
+/// Both substitutions are shell-quoted; an unknown `%x` is passed through.
+fn expand_restore_command(tmpl: &str, name: &str, dest: &str) -> String {
+    let mut out = String::with_capacity(tmpl.len() + name.len() + dest.len());
+    let mut chars = tmpl.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('f') => out.push_str(&sh_quote(name)),
+            Some('p') => out.push_str(&sh_quote(dest)),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
 impl SegmentDir {
     pub fn new(dir: impl AsRef<Path>) -> Self {
-        Self { dir: dir.as_ref().to_path_buf(), cache: HashMap::new(), last_miss: None }
+        Self {
+            dir: dir.as_ref().to_path_buf(),
+            cache: HashMap::new(),
+            last_miss: None,
+            restore_command: None,
+        }
     }
 
-    /// `wal-g [--config <path>] wal-fetch <segment> <dest>`. Returns Ok(false)
-    /// rather than an error when wal-g exits nonzero: that means "not archived
-    /// yet", the same as a missing file, and the caller retries instead of
-    /// aborting. Repeat asks for a segment that keeps missing are spaced out by
-    /// `fetch_is_due`.
-    fn walg_fetch(&mut self, name: &str, dest: &Path) -> Result<bool> {
+    /// Override the archive fetcher with a PostgreSQL-style `restore_command`
+    /// template (`%f` segment name, `%p` destination). `None` keeps the default
+    /// wal-g fallback.
+    pub fn with_restore_command(mut self, cmd: Option<String>) -> Self {
+        self.restore_command = cmd;
+        self
+    }
+
+    /// Fetch `name` into `dest` from the archive. Returns Ok(false) rather than
+    /// an error when the fetcher exits nonzero: that means "not archived yet",
+    /// the same as a missing file, and the caller retries instead of aborting.
+    /// Repeat asks for a segment that keeps missing are spaced out by
+    /// `fetch_is_due`. Uses `restore_command` when set, else `wal-g wal-fetch`
+    /// when wal-g is configured, else nothing.
+    fn fetch(&mut self, name: &str, dest: &Path) -> Result<bool> {
+        let restore = self.restore_command.clone();
         let config = std::env::var("PGS3_WALG_CONFIG").ok();
-        if config.is_none() && std::env::var_os("WALG_S3_PREFIX").is_none() {
+        let have_walg = config.is_some() || std::env::var_os("WALG_S3_PREFIX").is_some();
+        if restore.is_none() && !have_walg {
             return Ok(false);
         }
         let due = {
@@ -163,15 +227,23 @@ impl SegmentDir {
         if !due {
             return Ok(false);
         }
-        let walg = std::env::var("PGS3_WALG_BIN").unwrap_or_else(|_| "wal-g".into());
-        let mut cmd = std::process::Command::new(&walg);
-        if let Some(path) = &config {
-            cmd.args(["--config", path]);
-        }
-        let status = cmd
-            .args(["wal-fetch", name, dest.to_str().context("--wal path is not valid UTF-8")?])
-            .status()
-            .with_context(|| format!("running `{walg} wal-fetch {name}`"))?;
+        let dest_str = dest.to_str().context("--wal path is not valid UTF-8")?;
+        let status = if let Some(tmpl) = &restore {
+            let cmd = expand_restore_command(tmpl, name, dest_str);
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &cmd])
+                .status()
+                .with_context(|| format!("running restore_command for {name}"))?
+        } else {
+            let walg = std::env::var("PGS3_WALG_BIN").unwrap_or_else(|_| "wal-g".into());
+            let mut cmd = std::process::Command::new(&walg);
+            if let Some(path) = &config {
+                cmd.args(["--config", path]);
+            }
+            cmd.args(["wal-fetch", name, dest_str])
+                .status()
+                .with_context(|| format!("running `{walg} wal-fetch {name}`"))?
+        };
         if status.success() {
             self.last_miss = None;
             return Ok(true);
@@ -186,8 +258,9 @@ impl SegmentDir {
         if !self.cache.contains_key(&segno) {
             let name = crate::lsn::segment_name(tli, segno, seg_size);
             let path = self.dir.join(&name);
-            if !path.exists() && !self.walg_fetch(&name, &path)? {
-                // Not on disk and wal-g couldn't get it either: treat exactly
+            if !path.exists() && !self.fetch(&name, &path)? {
+                // Not on disk and the archive fetcher couldn't get it either:
+                // treat exactly
                 // like a missing file below, since we only ever read forward.
                 return Err(anyhow::Error::new(SegmentUnavailable(name)));
             }
@@ -615,5 +688,26 @@ mod tests {
         assert_eq!(next_wait(None), FETCH_RETRY_MIN);
         assert_eq!(next_wait(Some(Duration::from_secs(4))), Duration::from_secs(8));
         assert_eq!(next_wait(Some(FETCH_RETRY_MAX)), FETCH_RETRY_MAX);
+    }
+
+    #[test]
+    fn restore_command_substitutes_and_quotes_like_postgres() {
+        assert_eq!(
+            expand_restore_command(
+                "pgbackrest --stanza=main archive-get %f \"%p\"",
+                "00000001000000000000000A",
+                "/tmp/walcache/00000001000000000000000A"
+            ),
+            "pgbackrest --stanza=main archive-get '00000001000000000000000A' \
+             \"'/tmp/walcache/00000001000000000000000A'\""
+        );
+        // Paths with spaces and quotes survive intact.
+        assert_eq!(
+            expand_restore_command("cp %f %p", "seg", "/tmp/a b/it's"),
+            r#"cp 'seg' '/tmp/a b/it'\''s'"#
+        );
+        assert_eq!(expand_restore_command("echo 100%% done", "s", "d"), "echo 100% done");
+        // Unknown % codes pass through; a trailing % stays.
+        assert_eq!(expand_restore_command("x %z %", "s", "d"), "x %z %");
     }
 }

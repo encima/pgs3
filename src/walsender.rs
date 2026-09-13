@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 
 pub struct Options {
     pub wal_dir: PathBuf,
+    /// PostgreSQL-style restore_command template for archive fetches; None
+    /// keeps SegmentDir's wal-g fallback.
+    pub restore_command: Option<String>,
     pub tli: u32,
     pub seg_size: u64,
     pub version: PgVersion,
@@ -84,6 +87,11 @@ impl Conn {
             return Ok(None);
         }
         let len = u32::from_be_bytes(self.inbuf[1..5].try_into()?) as usize;
+        // The length counts itself, so 4 is the floor; below that the frame is
+        // malformed, not partial, and the slice below would panic.
+        if len < 4 {
+            bail!("malformed message: declared length {len} below the 4-byte minimum");
+        }
         if self.inbuf.len() < len + 1 {
             return Ok(None);
         }
@@ -91,16 +99,6 @@ impl Conn {
         let body = self.inbuf[5..len + 1].to_vec();
         self.inbuf.drain(..len + 1);
         Ok(Some((tag, body)))
-    }
-
-    /// Block until a complete tagged message arrives.
-    fn message(&mut self) -> Result<(u8, Vec<u8>)> {
-        loop {
-            if let Some(m) = self.try_message()? {
-                return Ok(m);
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
     }
 
     fn row_description(&mut self, cols: &[(&str, u32)]) -> Result<()> {
@@ -186,6 +184,9 @@ pub fn serve(addr: &str, cat: &Catalog, opts: Options) -> Result<()> {
 fn session(stream: TcpStream, cat: &Catalog, opts: &Options) -> Result<bool> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_millis(20)))?;
+    // A subscriber that stops reading must not park write_all forever and
+    // freeze the single-connection listener with it.
+    stream.set_write_timeout(Some(Duration::from_secs(60)))?;
     let mut conn = Conn { stream, inbuf: Vec::new() };
 
     // libpq turns this into PQserverVersion, which the apply worker uses to pick
@@ -193,20 +194,30 @@ fn session(stream: TcpStream, cat: &Catalog, opts: &Options) -> Result<bool> {
     let v = cat.server_version_num;
     handshake(&mut conn, &format!("{}.{}", v / 10000, v % 10000))?;
 
+    // Same reason as the handshake deadline: a client that completes startup
+    // and then goes quiet must not hold the listener shut.
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     loop {
-        let (tag, body) = conn.message()?;
-        match tag {
-            b'X' => return Ok(false),
-            b'Q' => {
-                let sql = String::from_utf8_lossy(&body)
-                    .trim_end_matches('\0')
-                    .trim()
-                    .to_string();
-                if let Some(caught_up) = simple_query(&mut conn, &sql, cat, opts)? {
-                    return Ok(caught_up);
+        match conn.try_message()? {
+            Some((tag, body)) => match tag {
+                b'X' => return Ok(false),
+                b'Q' => {
+                    let sql = String::from_utf8_lossy(&body)
+                        .trim_end_matches('\0')
+                        .trim()
+                        .to_string();
+                    if let Some(caught_up) = simple_query(&mut conn, &sql, cat, opts)? {
+                        return Ok(caught_up);
+                    }
                 }
+                other => bail!("unexpected message type {:?} before streaming", other as char),
+            },
+            None => {
+                if Instant::now() > deadline {
+                    bail!("subscriber sent no command within {HANDSHAKE_TIMEOUT:?} of connecting");
+                }
+                std::thread::sleep(Duration::from_millis(2));
             }
-            other => bail!("unexpected message type {:?} before streaming", other as char),
         }
     }
 }
@@ -240,6 +251,12 @@ fn handshake(conn: &mut Conn, server_version: &str) -> Result<()> {
                 conn.flush()?;
             }
             196608 => {
+                // Postgres caps the startup packet at 10 KB; an
+                // attacker-declared length must not size our buffer.
+                const MAX_STARTUP_PACKET_LENGTH: usize = 10000;
+                if !(8..=MAX_STARTUP_PACKET_LENGTH).contains(&len) {
+                    bail!("startup packet declares an impossible length of {len} bytes");
+                }
                 while conn.inbuf.len() < len {
                     if Instant::now() > deadline {
                         bail!("startup packet never completed");
@@ -316,7 +333,9 @@ fn simple_query(conn: &mut Conn, sql: &str, cat: &Catalog, opts: &Options) -> Re
 
 /// Parse `key 'value'` pairs out of the option list of START_REPLICATION.
 fn option<'a>(sql: &'a str, key: &str) -> Option<&'a str> {
-    let at = sql.to_lowercase().find(&format!("{key} '"))?;
+    // ASCII folding only: to_lowercase() can change byte lengths (İ), which
+    // would shift the index against the original string.
+    let at = sql.to_ascii_lowercase().find(&format!("{key} '"))?;
     let rest = &sql[at + key.len() + 2..];
     rest.find('\'').map(|e| &rest[..e])
 }
@@ -346,11 +365,17 @@ fn stream(conn: &mut Conn, sql: &str, cat: &Catalog, opts: &Options) -> Result<b
     // committed at or before that point is already applied. We still have to
     // *read* from restart_lsn to pick up transactions that straddle it, and
     // suppress the ones it has already seen.
-    let resume = sql
+    let Some(resume) = sql
         .split_whitespace()
-        .find(|w| w.contains('/') && Lsn::parse(w).is_ok())
+        .find(|w| w.contains('/'))
         .and_then(|w| Lsn::parse(w).ok())
-        .unwrap_or_default();
+    else {
+        // Resuming at zero would silently re-deliver everything instead of
+        // failing on a command we cannot honor.
+        let m = format!("START_REPLICATION without a resume LSN: {sql}");
+        conn.error(&m)?;
+        bail!(m);
+    };
     if resume.0 != 0 && resume < opts.start {
         let m = format!(
             "subscriber asked to resume at {resume}, but the archive only reaches back to \
@@ -367,7 +392,7 @@ fn stream(conn: &mut Conn, sql: &str, cat: &Catalog, opts: &Options) -> Result<b
     conn.send(b'W', &[0, 0, 0])?;
     conn.flush()?;
 
-    let src = SegmentDir::new(&opts.wal_dir);
+    let src = SegmentDir::new(&opts.wal_dir).with_restore_command(opts.restore_command.clone());
     let mut reader =
         WalReader::new(src, opts.tli, opts.seg_size, from, opts.end, opts.version, opts.sysid);
     reader.verify_provenance()?;
@@ -390,14 +415,14 @@ fn stream(conn: &mut Conn, sql: &str, cat: &Catalog, opts: &Options) -> Result<b
         // decision to stop.
         while let Some((tag, body)) = conn.try_message()? {
             match tag {
-                b'd' if !body.is_empty() && body[0] == b'r' => {
+                b'd' if body.first() == Some(&b'r') && body.len() >= 34 => {
                     // StandbyStatusUpdate: write, flush, apply, clock, replyRequested
                     let flush = Lsn(u64::from_be_bytes(body[9..17].try_into()?));
                     if flush > confirmed {
                         confirmed = flush;
                         publish_confirmed(opts, confirmed)?;
                     }
-                    if body.len() > 33 && body[33] == 1 {
+                    if body[33] == 1 {
                         keepalive(conn, last_commit_end, false)?;
                     }
                 }
@@ -509,4 +534,18 @@ fn publish_confirmed(opts: &Options, lsn: Lsn) -> Result<()> {
     std::fs::write(&tmp, format!("{lsn}\n"))?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn option_survives_non_ascii_input() {
+        // to_lowercase() would turn the 2-byte İ into 3 bytes and shift the
+        // index used against the original string; ASCII folding keeps them in step.
+        let sql = "START_REPLICATION SLOT \"İx\" LOGICAL 0/1 (binary 'true')";
+        assert_eq!(option(sql, "binary"), Some("true"));
+        assert_eq!(option(sql, "streaming"), None);
+    }
 }

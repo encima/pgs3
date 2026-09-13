@@ -17,12 +17,23 @@ use version::PgVersion;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: pgs3 <frame|decode|pgoutput|serve> --wal <dir> --start <lsn> --end <lsn> \
+    let usage = "usage: pgs3 init --source <conninfo> --target <conninfo> --catalog <file> \
+                 [--publication <name>]
+       pgs3 <frame|decode|pgoutput|serve> --wal <dir> --start <lsn> --end <lsn> \
                  [--catalog <file>] [--server-version <num>] [--tli <n>] \
-                 [--wal-segment-size <bytes>] [--allow-catalog-changes]
+                 [--wal-segment-size <bytes>] [--allow-catalog-changes] \
+                 [--restore-command <cmd>]
+
+init captures the catalog dictionary from the source at T0 and copies the
+schema to the target (needs psql and pg_dump in PATH).
 
 The catalog dictionary supplies the source server version, WAL segment size and
 system identifier. `frame` can run without one if --server-version is given.
+
+--restore-command fetches missing segments from the archive, PostgreSQL-style:
+any shell command where %f is the segment name and %p the local destination,
+e.g. 'pgbackrest --stanza=main archive-get %f %p'. Env: PGS3_RESTORE_COMMAND.
+Without it, falls back to wal-g when WALG_S3_PREFIX/PGS3_WALG_CONFIG are set.
 
 serve options:
   --listen <addr>              default 127.0.0.1:5439
@@ -33,6 +44,9 @@ serve options:
     let get = |k: &str| -> Option<String> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
     };
+    if mode == "init" {
+        return init(&get, usage);
+    }
     let wal = get("--wal").context(usage)?;
     let start = Lsn::parse(&get("--start").context(usage)?)?;
     let end = Lsn::parse(&get("--end").context(usage)?)?;
@@ -50,14 +64,37 @@ serve options:
         (None, None) => anyhow::bail!("need --catalog or --server-version\n\n{usage}"),
     };
     version.check_supported()?;
-    let seg_size = match (get("--wal-segment-size"), &cat) {
+    let seg_size: u64 = match (get("--wal-segment-size"), &cat) {
         (Some(v), _) => v.parse()?,
         (None, Some(c)) => c.wal_segment_size,
         (None, None) => DEFAULT_WAL_SEG_SIZE,
     };
-    let sysid = cat.as_ref().and_then(|c| c.system_identifier.parse::<u64>().ok());
+    // Segment size divides every LSN and sizes page-header offsets; a bad one
+    // is a divide-by-zero or a slice panic deep inside the reader.
+    anyhow::ensure!(
+        seg_size.is_power_of_two() && (1 << 20..=1 << 30).contains(&seg_size),
+        "WAL segment size {seg_size} is not a power of two between 1MB and 1GB"
+    );
+    // A dictionary without a usable identifier must not silently disable the
+    // archive-provenance check.
+    let sysid = cat.as_ref().and_then(|c| match c.system_identifier.parse::<u64>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            eprintln!(
+                "pgs3: warning: dictionary system_identifier {:?} is not a number; \
+                 the archive-provenance check is disabled",
+                c.system_identifier
+            );
+            None
+        }
+    });
 
-    let src = xlog::SegmentDir::new(&wal);
+    // --restore-command wins over the env var; both are optional and fall back
+    // to wal-g inside SegmentDir when neither is set.
+    let restore_command =
+        get("--restore-command").or_else(|| std::env::var("PGS3_RESTORE_COMMAND").ok());
+
+    let src = xlog::SegmentDir::new(&wal).with_restore_command(restore_command.clone());
     let mut reader = xlog::WalReader::new(src, tli, seg_size, start, end, version, sysid);
     reader.verify_provenance()?;
 
@@ -111,6 +148,7 @@ serve options:
             pgoutput::check_publication_encodable(cat)?;
             let opts = walsender::Options {
                 wal_dir: wal.clone().into(),
+                restore_command,
                 tli,
                 seg_size,
                 version,
@@ -126,5 +164,87 @@ serve options:
         }
         _ => anyhow::bail!(usage),
     }
+    Ok(())
+}
+
+/// One-shot bootstrap at T0: capture the frozen dictionary from the source and
+/// copy the schema to the target. Shells out to psql/pg_dump -- the workflow
+/// already requires them, and a replication protocol client in the binary
+/// would be a second implementation of the same thing.
+fn init(get: &dyn Fn(&str) -> Option<String>, usage: &str) -> Result<()> {
+    let source = get("--source").context("--source <conninfo> for the source primary\n\n".to_owned() + usage)?;
+    let target = get("--target").context("--target <conninfo> for the destination\n\n".to_owned() + usage)?;
+    let catalog_path = get("--catalog").context("--catalog <file> to write the dictionary to\n\n".to_owned() + usage)?;
+    let publication = get("--publication").unwrap_or_else(|| "p".into());
+
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // Dictionary first: its captured_at_lsn is T0, and from here on the
+    // source's schema must not change.
+    let sql = include_str!("../sql/dump_catalog.sql");
+    let mut child = Command::new("psql")
+        .args([
+            "-X", "-t", "-A", "-q",
+            "-f", "-",
+            "-v", &format!("pubname={publication}"),
+            &source,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("spawning psql (is it in PATH?)")?;
+    child
+        .stdin
+        .as_mut()
+        .context("piped stdin")?
+        .write_all(sql.as_bytes())?;
+    drop(child.stdin.take()); // close stdin so psql runs the script
+    let out = child.wait_with_output().context("running psql")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "psql failed capturing the dictionary from the source:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(&catalog_path, &out.stdout)
+        .with_context(|| format!("writing {catalog_path}"))?;
+    // Validate what we captured before touching the target.
+    let cat = catalog::Catalog::load(&catalog_path)?;
+    eprintln!(
+        "pgs3: dictionary for {} published relation(s) written to {catalog_path} (T0 = {})",
+        cat.relations.len(),
+        cat.captured_at_lsn
+    );
+
+    // Schema copy: pg_dump --schema-only | psql.
+    let dump = Command::new("pg_dump")
+        .args(["--schema-only", "--no-owner", "--no-privileges", &source])
+        .output()
+        .context("spawning pg_dump (is it in PATH?)")?;
+    anyhow::ensure!(
+        dump.status.success(),
+        "pg_dump failed:\n{}",
+        String::from_utf8_lossy(&dump.stderr)
+    );
+    let mut child = Command::new("psql")
+        .args(["-X", "-q", "-v", "ON_ERROR_STOP=1", &target])
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("spawning psql for the target")?;
+    child
+        .stdin
+        .as_mut()
+        .context("piped stdin")?
+        .write_all(&dump.stdout)?;
+    drop(child.stdin.take());
+    let status = child.wait().context("applying the schema to the target")?;
+    anyhow::ensure!(status.success(), "applying the schema to the target failed");
+
+    eprintln!("pgs3: schema applied to the target");
+    eprintln!(
+        "pgs3: next: create the logical replication slot on the source and the \
+         subscription on the primary (see README); do not run DDL on the source \
+         from here on"
+    );
     Ok(())
 }

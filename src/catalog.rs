@@ -99,7 +99,26 @@ impl Catalog {
         let text = std::fs::read_to_string(path.as_ref())
             .with_context(|| format!("reading catalog dictionary {:?}", path.as_ref()))?;
         let mut cat: Catalog = serde_json::from_str(&text).context("parsing catalog dictionary")?;
+        // The dictionary is trusted input, but a malformed one would otherwise
+        // surface much later as corrupt pgoutput frames or a decoding loop
+        // that never advances.
+        for r in &cat.relations {
+            anyhow::ensure!(
+                !r.nspname.contains('\0') && !r.relname.contains('\0'),
+                "{}: NUL byte in relation name would corrupt pgoutput framing",
+                r.qualified_name()
+            );
+            for c in &r.columns {
+                anyhow::ensure!(!c.attname.contains('\0'), "{}.{}: NUL byte in column name", r.qualified_name(), c.attname);
+                anyhow::ensure!(c.attlen != 0, "{}.{}: attlen 0 would stall the tuple walk", r.qualified_name(), c.attname);
+                if let Some(e) = &c.elem {
+                    anyhow::ensure!(e.typlen != 0, "{}.{}: array element typlen 0 would stall the payload walk", r.qualified_name(), c.attname);
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
         for (i, r) in cat.relations.iter().enumerate() {
+            anyhow::ensure!(seen.insert(r.relfilenode), "duplicate relfilenode {} in dictionary", r.relfilenode);
             cat.by_relfilenode.insert(r.relfilenode, i);
             if let Some(t) = r.toast_relfilenode {
                 cat.by_toast_relfilenode.insert(t, i);
@@ -107,6 +126,12 @@ impl Catalog {
         }
         cat.published_oids = cat.relations.iter().map(|r| r.oid).collect();
         Ok(cat)
+    }
+
+    /// A published relation by Oid (what TRUNCATE records carry).
+    pub fn by_oid(&self, oid: u32) -> Option<&Relation> {
+        // ponytail: linear scan; dictionaries hold published tables, not millions.
+        self.relations.iter().find(|r| r.oid == oid)
     }
 
     /// A published relation whose heap this WAL record touches.

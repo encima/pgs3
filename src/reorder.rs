@@ -1,15 +1,16 @@
 //! Reorder buffer: WAL interleaves transactions, logical replication does not.
 //!
-//! Buffer changes per top-level xid, collect TOAST chunks alongside them, and
-//! emit in commit order once the commit record arrives. Aborted transactions
-//! are dropped without ever being emitted.
+//! Buffer changes per writing xid, collect TOAST chunks alongside them, merge
+//! subtransactions at commit, and emit in commit order once the commit record
+//! arrives. Aborted transactions -- and subtransactions the commit record does
+//! not list -- are dropped without ever being emitted.
 
 use crate::catalog::{Catalog, Relation};
 use crate::lsn::Lsn;
 use crate::rmgr::{self, HeapOp, RawTuple};
 use crate::tuple::{self, Datum};
 use crate::xlog::{Record, RM_HEAP2_ID, RM_HEAP_ID, RM_XACT_ID};
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
@@ -18,7 +19,6 @@ pub enum Kind {
     Insert,
     Update,
     Delete,
-    Truncate,
 }
 
 impl fmt::Display for Kind {
@@ -27,7 +27,6 @@ impl fmt::Display for Kind {
             Kind::Insert => "INSERT",
             Kind::Update => "UPDATE",
             Kind::Delete => "DELETE",
-            Kind::Truncate => "TRUNCATE",
         })
     }
 }
@@ -85,17 +84,18 @@ impl<'a> ReorderBuffer<'a> {
         }
     }
 
-    /// Attribute a change to its top-level transaction. Records carry the
-    /// top-level xid directly once a subtransaction has written one; before
-    /// that we rely on the assignment records.
-    fn top_of(&self, r: &Record) -> u32 {
-        r.toplevel_xid
-            .unwrap_or_else(|| *self.subxact_to_top.get(&r.xid).unwrap_or(&r.xid))
-    }
-
     pub fn feed(&mut self, r: &Record) -> Result<Vec<Event<'a>>> {
         match r.rmid {
             RM_HEAP_ID | RM_HEAP2_ID => {
+                // PG14+ tags the first record of a subtransaction with its
+                // top-level xid. Record the parentage so a rolled-back savepoint
+                // can be dropped at the top-level commit; attribution itself
+                // stays by writing xid until then.
+                if let Some(top) = r.toplevel_xid {
+                    if top != r.xid {
+                        self.subxact_to_top.insert(r.xid, top);
+                    }
+                }
                 // Catalog writes are checked from the raw record, before
                 // parse_heap discards them for lacking logical-decoding flags.
                 if let Some(b) = r.block(0) {
@@ -115,6 +115,26 @@ impl<'a> ReorderBuffer<'a> {
     }
 
     fn feed_heap(&mut self, r: &Record) -> Result<()> {
+        // TRUNCATE carries its relations in main data (no block reference).
+        // It assigns a new relfilenode to the table and its toast, which the
+        // frozen dictionary cannot follow -- refuse rather than silently drop
+        // every row written afterwards.
+        if r.rmid == RM_HEAP_ID && r.heap_opcode() == rmgr::XLOG_HEAP_TRUNCATE {
+            let (db_oid, relids) = rmgr::parse_truncate(r)?;
+            if db_oid == self.cat.database_oid {
+                if let Some(rel) = relids.iter().find_map(|o| self.cat.by_oid(*o)) {
+                    bail!(
+                        "TRUNCATE of published relation {} at {}: truncate assigns a new \
+                         relfilenode, which the frozen catalog dictionary cannot follow. \
+                         Re-capture the dictionary at a new T0.",
+                        rel.qualified_name(),
+                        r.lsn
+                    );
+                }
+            }
+            return Ok(());
+        }
+
         let Some((rloc, op)) = rmgr::parse_heap(r)? else {
             return Ok(());
         };
@@ -132,7 +152,6 @@ impl<'a> ReorderBuffer<'a> {
                 // chunks arrive as inserts, so deletes here are not interesting.
                 _ => return Ok(()),
             };
-            let top = self.top_of(r);
             for t in tuples {
                 let vals =
                     tuple::deform(&t.data, t.infomask, t.infomask2, t.t_hoff, &tuple::TOAST_CHUNK_ATTRS)?;
@@ -144,7 +163,7 @@ impl<'a> ReorderBuffer<'a> {
                 let value_id = u32::from_le_bytes(id[..].try_into()?);
                 let chunk_seq = u32::from_le_bytes(seq[..].try_into()?);
                 self.xacts
-                    .entry(top)
+                    .entry(r.xid)
                     .or_default()
                     .toast
                     .entry(value_id)
@@ -160,9 +179,8 @@ impl<'a> ReorderBuffer<'a> {
         let attrs: Vec<tuple::AttrDesc> = rel.columns.iter().map(Into::into).collect();
         let de = |t: &RawTuple| tuple::deform(&t.data, t.infomask, t.infomask2, t.t_hoff, &attrs);
 
-        let top = self.top_of(r);
         let mut push = |kind, old, new| {
-            self.xacts.entry(top)
+            self.xacts.entry(r.xid)
                 .or_default()
                 .changes
                 .push(Change { lsn: r.lsn, relfilenode: rloc.rel_number, kind, old, new });
@@ -190,7 +208,6 @@ impl<'a> ReorderBuffer<'a> {
                 let o = old.as_ref().map(de).transpose()?;
                 push(Kind::Delete, o, None)
             }
-            HeapOp::Truncate => push(Kind::Truncate, None, None),
         }
         Ok(())
     }
@@ -200,21 +217,37 @@ impl<'a> ReorderBuffer<'a> {
     /// Both catalogs lead with the Oid of the relation they describe, so an
     /// INSERT or UPDATE can be attributed exactly: DDL on an unpublished table,
     /// and the temp-table churn that a busy system produces constantly, are
-    /// ignored. Statistics updates from (auto)vacuum and analyze never reach
-    /// here at all -- they use heap_inplace_update, whose XLOG_HEAP_INPLACE
-    /// record `parse_heap` does not decode.
+    /// ignored. Only opcodes that carry tuple images are examined below --
+    /// XLOG_HEAP_INPLACE (vacuum/analyze statistics), lock records, and HEAP2
+    /// prune/visible traffic touch catalog pages harmlessly all day, and must
+    /// not burn the one warning the unattributable path gets.
     ///
     /// Deletes are the gap: catalogs are not logically logged, so a catalog
     /// DELETE carries no old tuple and cannot be attributed. DROP COLUMN is an
-    /// UPDATE (it sets attisdropped) so it is still caught; a DROP TABLE simply
-    /// stops producing changes. That leaves a warning rather than a refusal.
+    /// UPDATE (it sets attisdropped) so it is caught when the update keeps its
+    /// tuple image intact; a delta-compressed one (see `raw_tuples`) and a DROP
+    /// TABLE fall to the warning. That leaves a warning rather than a refusal.
     fn check_rowtype_catalog_write(&mut self, r: &Record, catname: &str) -> Result<()> {
         if !self.strict_ddl {
             return Ok(());
         }
+        let op = r.heap_opcode();
+        let carries_tuples = (r.rmid == RM_HEAP_ID
+            && matches!(
+                op,
+                rmgr::XLOG_HEAP_INSERT
+                    | rmgr::XLOG_HEAP_DELETE
+                    | rmgr::XLOG_HEAP_UPDATE
+                    | rmgr::XLOG_HEAP_HOT_UPDATE
+            ))
+            || (r.rmid == RM_HEAP2_ID && op == rmgr::XLOG_HEAP2_MULTI_INSERT);
+        if !carries_tuples {
+            return Ok(());
+        }
         let tuples = rmgr::raw_tuples(r)?;
         if tuples.is_empty() {
-            // A DELETE, or a record whose tuple data was folded into a
+            // A DELETE, a delta-compressed UPDATE whose leading Oid was
+            // stripped, or a record whose tuple data was folded into a
             // full-page image. Either way there is nothing to attribute.
             if !self.warned_catalog_delete {
                 self.warned_catalog_delete = true;
@@ -255,17 +288,12 @@ impl<'a> ReorderBuffer<'a> {
         let op = r.info & 0x70;
         match op {
             rmgr::XLOG_XACT_ASSIGNMENT => {
+                // Parentage only. Changes stay keyed by the writing xid and
+                // are merged at commit for exactly the subxacts the commit
+                // record lists, so a rolled-back savepoint is never emitted.
                 let (top, subs) = rmgr::parse_assignment(r)?;
                 for s in subs {
                     self.subxact_to_top.insert(s, top);
-                    // Fold anything already buffered under the subxact.
-                    if let Some(sub) = self.xacts.remove(&s) {
-                        let parent = self.xacts.entry(top).or_default();
-                        parent.changes.extend(sub.changes);
-                        for (k, v) in sub.toast {
-                            parent.toast.entry(k).or_default().extend(v);
-                        }
-                    }
                 }
                 Ok(Vec::new())
             }
@@ -276,12 +304,12 @@ impl<'a> ReorderBuffer<'a> {
                     self.xacts.remove(x);
                     self.subxact_to_top.remove(x);
                 }
+                self.forget_subxacts(r.xid, &[]);
                 Ok(Vec::new())
             }
 
             rmgr::XLOG_XACT_COMMIT | rmgr::XLOG_XACT_COMMIT_PREPARED => {
                 let info = rmgr::parse_xact(r)?;
-                // Merge any subtransactions the assignment records did not cover.
                 let mut xact = self.xacts.remove(&r.xid).unwrap_or_default();
                 for s in &info.subxacts {
                     if let Some(sub) = self.xacts.remove(s) {
@@ -290,8 +318,8 @@ impl<'a> ReorderBuffer<'a> {
                             xact.toast.entry(k).or_default().extend(v);
                         }
                     }
-                    self.subxact_to_top.remove(s);
                 }
+                self.forget_subxacts(r.xid, &info.subxacts);
                 if xact.changes.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -324,6 +352,30 @@ impl<'a> ReorderBuffer<'a> {
             _ => Ok(Vec::new()),
         }
     }
+
+    /// Forget every subtransaction attributed to `top`. Those listed in the
+    /// xact record were merged at commit; anything else mapped to this top
+    /// (assignment record or PG14+ toplevel_xid tag) rolled back -- subxact
+    /// aborts write no WAL -- so its buffered changes are dropped and its
+    /// memory freed. Without this, exception-handler-heavy workloads grow the
+    /// buffer without bound and a recycled xid merges stale changes.
+    fn forget_subxacts(&mut self, top: u32, committed: &[u32]) {
+        // ponytail: linear `contains`; swap for a HashSet if commits with
+        // thousands of subxacts ever matter.
+        let dead: Vec<u32> = self
+            .subxact_to_top
+            .iter()
+            .filter(|(s, t)| **t == top && !committed.contains(s))
+            .map(|(s, _)| *s)
+            .collect();
+        for s in dead {
+            self.xacts.remove(&s);
+            self.subxact_to_top.remove(&s);
+        }
+        for s in committed {
+            self.subxact_to_top.remove(s);
+        }
+    }
 }
 
 /// Replace external TOAST pointers with their reassembled value. A pointer with
@@ -338,7 +390,16 @@ fn detoast(
             Datum::Toast(p) => match chunks.get(&p.value_id) {
                 None => Datum::UnchangedToast,
                 Some(map) => {
-                    let mut buf = Vec::with_capacity(p.ext_size as usize);
+                    // The pointer comes from untrusted WAL: a raw_size below 4
+                    // would wrap the subtraction below, and ext_size sizes an
+                    // allocation before anything is verified.
+                    ensure!(
+                        p.raw_size >= 4 && (p.raw_size as u64) <= (1 << 30),
+                        "TOAST pointer for value {} claims raw size {}",
+                        p.value_id,
+                        p.raw_size
+                    );
+                    let mut buf = Vec::with_capacity((p.ext_size as usize).min(1 << 20));
                     for (i, (seq, bytes)) in map.iter().enumerate() {
                         if *seq as usize != i {
                             bail!(
@@ -376,9 +437,6 @@ pub fn render(e: &Event) -> Option<String> {
         Event::Commit { xid, .. } => Some(format!("COMMIT {xid}")),
         Event::Change { rel, kind, old, new, .. } => {
             let mut s = format!("table {}: {}:", rel.qualified_name(), kind);
-            if *kind == Kind::Truncate {
-                return Some(s);
-            }
             if let Some(old) = old {
                 s.push_str(" old-key:");
                 s.push_str(&render_row(rel, old, *kind == Kind::Update));
@@ -453,8 +511,13 @@ fn render_value(typname: &str, d: &Datum) -> String {
             f32::from_le_bytes(a[..4].try_into().unwrap()).to_string()
         }),
         "float8" => fixed(8).map_or_else(hexdump(bytes), |a| f64::from_le_bytes(a).to_string()),
-        "text" | "varchar" | "bpchar" | "name" | "json" | "xml" => {
+        "text" | "varchar" | "bpchar" | "json" | "xml" => {
             quote(&String::from_utf8_lossy(bytes))
+        }
+        "name" => {
+            // nameout stops at the terminator; the datum is NUL-padded to 64.
+            let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
+            quote(&String::from_utf8_lossy(&bytes[..end]))
         }
         "bytea" => quote(&format!("\\x{}", hex(bytes))),
         "numeric" => crate::numeric::parse(bytes)
