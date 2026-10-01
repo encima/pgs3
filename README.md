@@ -110,14 +110,16 @@ store. `devbox.json` provides the toolchain plus wal-g/minio for
 
 ### Primary
 
-- One-shot bootstrap: capture the dictionary at T0 **and** copy the schema to
-  the target (needs `psql` and `pg_dump` in `PATH`):
-  - `./pgs3 init --source 'host=primary dbname=yourdb' --target 'host=replica dbname=yourdb' --catalog catalog.json [--publication p]`
-  - The dictionary is validated before the target is touched; from T0 on, no DDL
-    (and no TRUNCATE) on published tables.
-- Or capture just the dictionary by hand:
+- One-shot bootstrap: capture the dictionary at T0 with a consistent start LSN
+  and timeline (needs `psql` in `PATH`):
+  - `./pgs3 init --source 'host=primary dbname=yourdb' --catalog catalog.json [--publication p]`
+  - The start LSN is the `restart_lsn` of a temporary logical slot, which is
+    dropped when init exits: nothing is left on the primary to retain WAL.
+  - Add `--target 'host=replica dbname=yourdb'` to also copy the schema there
+    (needs `pg_dump`). The dictionary is validated before the target is touched.
+  - From T0 on, no DDL (and no TRUNCATE) on published tables.
+- Or capture just the dictionary by hand (then pass `--start` to serve):
   - `psql -X -t -A -v pubname=p -f sql/dump_catalog.sql > catalog.json`
-- Get the LSN that you want to start from (maybe from catalog or `select pg_current_wal_lsn();`)
 
 ### PGS3 Host
 
@@ -130,7 +132,12 @@ store. `devbox.json` provides the toolchain plus wal-g/minio for
   - or wal-g's own env config, which is the implicit default fetcher:
     - `export PGS3_WALG_CONFIG=/etc/wal-g/config.json`
 - Run PGS3
-  - `./pgs3 serve --wal /tmp/walcache --catalog catalog.json --start "START_LSN" --end   "FFFFFFFF/FFFFFFFF" --listen 127.0.0.1:5439 --confirmed-lsn-file /run/pgs3.lsn`
+  - `./pgs3 serve --wal /tmp/walcache --catalog catalog.json --listen 127.0.0.1:5439 --confirmed-lsn-file /run/pgs3.lsn --source 'host=primary dbname=yourdb'`
+  - `--start` and `--tli` default to what init recorded; `--end` to never.
+  - `--source` lets pgs3 run `pg_switch_wal()` (at most every 30s) when the
+    segment it is waiting on is the one the primary is still writing, so the
+    tail reaches the archive without waiting for `archive_timeout`.
+  - Fetched segments are deleted once read.
 
 ### Subscriber
 

@@ -9,7 +9,7 @@ use crate::lsn::Lsn;
 use crate::pgoutput::{now_pg_timestamp, Encoder};
 use crate::reorder::{Event, ReorderBuffer};
 use crate::version::PgVersion;
-use crate::xlog::{SegmentDir, WalReader};
+use crate::xlog::{SegmentDir, SegmentUnavailable, WalReader};
 use anyhow::{bail, Context, Result};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -21,6 +21,8 @@ pub struct Options {
     /// PostgreSQL-style restore_command template for archive fetches; None
     /// keeps SegmentDir's wal-g fallback.
     pub restore_command: Option<String>,
+    /// Source conninfo for `pg_switch_wal()` when waiting on the live segment.
+    pub switch_wal_source: Option<String>,
     pub tli: u32,
     pub seg_size: u64,
     pub version: PgVersion,
@@ -392,13 +394,24 @@ fn stream(conn: &mut Conn, sql: &str, cat: &Catalog, opts: &Options) -> Result<b
     conn.send(b'W', &[0, 0, 0])?;
     conn.flush()?;
 
-    let src = SegmentDir::new(&opts.wal_dir).with_restore_command(opts.restore_command.clone());
+    let src = SegmentDir::new(&opts.wal_dir)
+        .with_restore_command(opts.restore_command.clone())
+        .with_switch_wal(opts.switch_wal_source.clone());
     let mut reader =
         WalReader::new(src, opts.tli, opts.seg_size, from, opts.end, opts.version, opts.sysid);
-    reader.verify_provenance()?;
+    // The start segment may still be the one the source is writing.
+    loop {
+        match reader.verify_provenance() {
+            Err(e) if e.downcast_ref::<SegmentUnavailable>().is_some() => {
+                keepalive(conn, resume.max(from), false)?;
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            r => break r?,
+        }
+    }
     let mut rb = ReorderBuffer::new(cat);
     rb.strict_ddl = opts.strict_ddl;
-    let mut enc = Encoder::new();
+    let mut enc = Encoder::new(cat);
 
     // Only commit boundaries count as progress: the subscriber's flush LSN
     // advances to a transaction's end_lsn once it has applied it, never to a

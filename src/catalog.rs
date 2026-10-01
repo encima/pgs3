@@ -18,6 +18,7 @@ use std::path::Path;
 /// encoder reads them.
 /// Element type of an array column: what the payload walk and the per-element
 /// encoder need.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct ElemType {
     pub oid: u32,
@@ -68,6 +69,36 @@ impl Relation {
 
 }
 
+/// A type reachable from a published column: the column's own type, array
+/// elements, domain base types and composite attributes, recursively. Enough
+/// to reproduce each type's `send()` from its on-disk bytes.
+#[derive(Debug, Deserialize)]
+pub struct TypeInfo {
+    pub oid: u32,
+    pub typname: String,
+    /// b(ase) c(omposite) d(omain) e(num) r(ange) m(ultirange) p(seudo)
+    pub typtype: char,
+    pub typlen: i16,
+    pub typalign: char,
+    /// Element type, for arrays.
+    pub elem: Option<u32>,
+    /// Base type, for domains.
+    pub basetype: Option<u32>,
+    /// `pg_enum` Oid and label, for enums.
+    pub labels: Option<Vec<(u32, String)>>,
+    /// Every attribute including dropped ones, for composites: dropped
+    /// attributes still occupy a slot in the stored tuple.
+    pub attrs: Option<Vec<TypeAttr>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TypeAttr {
+    pub atttypid: u32,
+    pub attlen: i16,
+    pub attalign: char,
+    pub attisdropped: bool,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct RowtypeCatalogs {
@@ -83,8 +114,16 @@ pub struct Catalog {
     pub server_version_num: i32,
     pub system_identifier: String,
     pub captured_at_lsn: String,
+    /// Consistent decoding start and its timeline, set by `pgs3 init`; absent
+    /// when the dictionary was dumped by hand.
+    pub start_lsn: Option<String>,
+    pub timeline_id: Option<u32>,
     pub relations: Vec<Relation>,
     pub rowtype_catalogs: RowtypeCatalogs,
+    #[serde(default)]
+    pub types: Vec<TypeInfo>,
+    #[serde(skip)]
+    types_by_oid: HashMap<u32, usize>,
     #[serde(skip)]
     by_relfilenode: HashMap<u32, usize>,
     /// toast relfilenode -> index of the relation that owns it
@@ -125,7 +164,19 @@ impl Catalog {
             }
         }
         cat.published_oids = cat.relations.iter().map(|r| r.oid).collect();
+        anyhow::ensure!(
+            cat.relations.is_empty() || !cat.types.is_empty(),
+            "dictionary has no type map (it predates it); capture it again with `pgs3 init`"
+        );
+        for (i, t) in cat.types.iter().enumerate() {
+            anyhow::ensure!(t.typlen != 0, "type {}: typlen 0 would stall the tuple walk", t.typname);
+            cat.types_by_oid.insert(t.oid, i);
+        }
         Ok(cat)
+    }
+
+    pub fn type_info(&self, oid: u32) -> Option<&TypeInfo> {
+        self.types_by_oid.get(&oid).map(|&i| &self.types[i])
     }
 
     /// A published relation by Oid (what TRUNCATE records carry).

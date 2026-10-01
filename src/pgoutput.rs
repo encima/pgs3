@@ -10,10 +10,10 @@
 //! need real structural conversion, so those are refused up front rather than
 //! guessed at.
 
-use crate::catalog::{Catalog, Column, ElemType, Relation};
+use crate::catalog::{Catalog, Column, Relation};
 use crate::reorder::{Event, Kind};
 use crate::tuple::Datum;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use std::collections::HashSet;
 
 /// Types whose `send()` output we can produce from the on-disk bytes.
@@ -28,33 +28,17 @@ const SUPPORTED: &[&str] = &[
 /// applied anything. Silently sending a wrong datum is far worse than refusing.
 pub fn check_publication_encodable(cat: &Catalog) -> Result<()> {
     let mut bad: Vec<String> = Vec::new();
-    let mut generated: Vec<String> = Vec::new();
     for rel in &cat.relations {
-        for c in &rel.columns {
-            if c.attisdropped {
-                continue;
-            }
-            if !c.attgenerated.is_empty() {
-                generated.push(format!("{}.{}", rel.qualified_name(), c.attname));
-            }
-            // For an array it is the element type that has to be encodable.
-            let effective = c.elem.as_ref().map_or(c.typname.as_str(), |e| e.typname.as_str());
-            if !SUPPORTED.contains(&effective) {
-                bad.push(format!("{}.{} is {}", rel.qualified_name(), c.attname, c.typname));
+        for c in columns(rel) {
+            if let Err(why) = encodable(cat, c.atttypid) {
+                bad.push(format!("{}.{} is {} ({why})", rel.qualified_name(), c.attname, c.typname));
             }
         }
-    }
-    if !generated.is_empty() {
-        bail!(
-            "publication contains generated columns, whose replication behaviour differs by \
-             server version and publication setting: {}",
-            generated.join(", ")
-        );
     }
     if !bad.is_empty() {
         bail!(
             "publication contains types this encoder cannot produce binary output for: {}\n\
-             Supported: {}",
+             Supported: {}, inet, cidr, reg*, and enums, domains, composites and arrays of them",
             bad.join(", "),
             SUPPORTED.join(", ")
         );
@@ -62,8 +46,41 @@ pub fn check_publication_encodable(cat: &Catalog) -> Result<()> {
     Ok(())
 }
 
+const REG: &[&str] = &[
+    "regclass", "regtype", "regproc", "regprocedure", "regoper", "regoperator", "regconfig",
+    "regdictionary", "regnamespace", "regrole", "regcollation",
+];
+
+/// Whether `send` can handle every value of type `oid`, and if not, why.
+fn encodable(cat: &Catalog, oid: u32) -> std::result::Result<(), String> {
+    let t = cat.type_info(oid).ok_or_else(|| format!("type {oid} missing from the dictionary"))?;
+    match t.typtype {
+        'd' => encodable(cat, t.basetype.ok_or("domain without a base type")?),
+        'e' => t.labels.as_ref().map(|_| ()).ok_or_else(|| "enum with no labels".into()),
+        'c' => t.attrs.iter().flatten().filter(|a| !a.attisdropped).try_for_each(|a| encodable(cat, a.atttypid)),
+        _ if t.elem.is_some() => encodable(cat, t.elem.unwrap()),
+        _ if SUPPORTED.contains(&t.typname.as_str())
+            || REG.contains(&t.typname.as_str())
+            || t.typname == "inet"
+            || t.typname == "cidr" =>
+        {
+            Ok(())
+        }
+        _ => Err(format!("no encoder for {}", t.typname)),
+    }
+}
+
+/// Columns pgoutput publishes: not dropped, and not generated. Generated
+/// columns are never sent before PG18, nor by PG18's default
+/// publish_generated_columns = none; the subscriber computes its own.
+// ponytail: a PG18 publication WITH (publish_generated_columns = stored) would
+// need them sent; capture pubgencols in the dictionary if that ever matters.
+fn published(c: &Column) -> bool {
+    !c.attisdropped && c.attgenerated.is_empty()
+}
+
 fn columns(rel: &Relation) -> impl Iterator<Item = &Column> {
-    rel.columns.iter().filter(|c| !c.attisdropped)
+    rel.columns.iter().filter(|c| published(c))
 }
 
 #[derive(Default)]
@@ -97,15 +114,16 @@ impl Buf {
     }
 }
 
-pub struct Encoder {
+pub struct Encoder<'a> {
+    cat: &'a Catalog,
     /// Relations already described to this subscriber. The catalog is frozen,
     /// so a relation never needs re-sending once announced.
     announced: HashSet<u32>,
 }
 
-impl Encoder {
-    pub fn new() -> Encoder {
-        Encoder { announced: HashSet::new() }
+impl<'a> Encoder<'a> {
+    pub fn new(cat: &'a Catalog) -> Encoder<'a> {
+        Encoder { cat, announced: HashSet::new() }
     }
 
     /// Encode one event, possibly preceded by a Relation message.
@@ -135,7 +153,7 @@ impl Encoder {
                     Kind::Insert => {
                         let new = new.as_ref().expect("INSERT always carries a new tuple");
                         b.u8(b'I').i32(rel.oid as i32).u8(b'N');
-                        b.bytes(&tuple_data(rel, new)?);
+                        b.bytes(&tuple_data(self.cat, rel, new)?);
                     }
                     Kind::Update => {
                         let new = new.as_ref().expect("UPDATE always carries a new tuple");
@@ -144,10 +162,10 @@ impl Encoder {
                             // 'O' is a whole old tuple (REPLICA IDENTITY FULL),
                             // 'K' is just the identity key.
                             b.u8(if rel.relreplident == 'f' { b'O' } else { b'K' });
-                            b.bytes(&tuple_data(rel, old)?);
+                            b.bytes(&tuple_data(self.cat, rel, old)?);
                         }
                         b.u8(b'N');
-                        b.bytes(&tuple_data(rel, new)?);
+                        b.bytes(&tuple_data(self.cat, rel, new)?);
                     }
                     Kind::Delete => {
                         let old = match old {
@@ -160,7 +178,7 @@ impl Encoder {
                         };
                         b.u8(b'D').i32(rel.oid as i32);
                         b.u8(if rel.relreplident == 'f' { b'O' } else { b'K' });
-                        b.bytes(&tuple_data(rel, old)?);
+                        b.bytes(&tuple_data(self.cat, rel, old)?);
                     }
                 }
                 out.push(b.0);
@@ -191,11 +209,11 @@ fn relation_message(rel: &Relation) -> Vec<u8> {
     b.0
 }
 
-fn tuple_data(rel: &Relation, vals: &[Datum]) -> Result<Vec<u8>> {
+fn tuple_data(cat: &Catalog, rel: &Relation, vals: &[Datum]) -> Result<Vec<u8>> {
     let mut b = Buf::default();
     b.i16(columns(rel).count() as i16);
     for (c, v) in rel.columns.iter().zip(vals) {
-        if c.attisdropped {
+        if !published(c) {
             continue;
         }
         match v {
@@ -211,7 +229,7 @@ fn tuple_data(rel: &Relation, vals: &[Datum]) -> Result<Vec<u8>> {
                 c.attname
             ),
             Datum::Fixed(bytes) | Datum::Var(bytes) => {
-                let wire = encode_datum(c, bytes)
+                let wire = send(cat, c.atttypid, bytes)
                     .with_context(|| format!("{}.{}", rel.qualified_name(), c.attname))?;
                 b.u8(b'b').i32(wire.len() as i32).bytes(&wire);
             }
@@ -221,16 +239,67 @@ fn tuple_data(rel: &Relation, vals: &[Datum]) -> Result<Vec<u8>> {
 }
 
 /// Encode one column value: an array walk, or a plain scalar conversion.
-pub fn encode_datum(col: &Column, bytes: &[u8]) -> Result<Vec<u8>> {
-    match &col.elem {
-        Some(e) => array_to_send(e, bytes),
-        None => to_send_format(&col.typname, bytes),
+/// What type `oid`'s `send()` would emit for these on-disk bytes.
+pub fn send(cat: &Catalog, oid: u32, b: &[u8]) -> Result<Vec<u8>> {
+    let t = cat.type_info(oid).with_context(|| format!("type {oid} missing from the dictionary"))?;
+    match t.typtype {
+        'd' => send(cat, t.basetype.context("domain without a base type")?, b),
+        'e' => {
+            // enum_send is the label; on disk it is the pg_enum row's Oid.
+            let o = u32::from_le_bytes(b.try_into().context("enum datum is not 4 bytes")?);
+            let (_, label) = t.labels.iter().flatten().find(|(e, _)| *e == o).with_context(|| {
+                format!("enum {} has no value {o}; was a label added after T0?", t.typname)
+            })?;
+            Ok(label.as_bytes().to_vec())
+        }
+        'c' => record_send(cat, t, b),
+        _ => match t.elem {
+            Some(e) => array_to_send(cat, e, b),
+            None => to_send_format(&t.typname, b),
+        },
     }
+}
+
+/// `record_send`: the count of live attributes, then per attribute its type
+/// Oid and its length-prefixed send() form, -1 for null. On disk a composite is
+/// a heap tuple header without its first 4 bytes (the varlena header we have
+/// already stripped), so the header fields sit 4 bytes early.
+fn record_send(cat: &Catalog, t: &crate::catalog::TypeInfo, b: &[u8]) -> Result<Vec<u8>> {
+    let attrs = t.attrs.as_ref().with_context(|| format!("composite {} has no attributes", t.typname))?;
+    ensure!(b.len() >= 19, "{} datum truncated inside its tuple header", t.typname);
+    let infomask2 = u16::from_le_bytes([b[14], b[15]]);
+    let infomask = u16::from_le_bytes([b[16], b[17]]);
+    let descs: Vec<_> = attrs
+        .iter()
+        .map(|a| crate::tuple::AttrDesc { attlen: a.attlen, attalign: a.attalign })
+        .collect();
+    let vals = crate::tuple::deform(&b[19..], infomask, infomask2, b[18], &descs)
+        .with_context(|| format!("composite {}", t.typname))?;
+    let mut out = Buf::default();
+    out.i32(attrs.iter().filter(|a| !a.attisdropped).count() as i32);
+    for (a, v) in attrs.iter().zip(&vals) {
+        if a.attisdropped {
+            continue;
+        }
+        out.i32(a.atttypid as i32);
+        match v {
+            Datum::Null => {
+                out.i32(-1);
+            }
+            Datum::Fixed(v) | Datum::Var(v) => {
+                let wire = send(cat, a.atttypid, v)?;
+                out.i32(wire.len() as i32).bytes(&wire);
+            }
+            other => bail!("{} attribute decoded as {other:?}", t.typname),
+        }
+    }
+    Ok(out.0)
 }
 
 /// `array_send`: dimensions, then every element length-prefixed in its own
 /// send format, row-major, with -1 for nulls.
-fn array_to_send(elem: &ElemType, payload: &[u8]) -> Result<Vec<u8>> {
+fn array_to_send(cat: &Catalog, elem_oid: u32, payload: &[u8]) -> Result<Vec<u8>> {
+    let elem = cat.type_info(elem_oid).with_context(|| format!("array element type {elem_oid} missing"))?;
     // Alignment inside an array is computed from the start of the ArrayType,
     // which includes the 4-byte varlena header our payload has already lost.
     // Put it back so 8-byte-aligned element types land where Postgres put them.
@@ -318,7 +387,7 @@ fn array_to_send(elem: &ElemType, payload: &[u8]) -> Result<Vec<u8>> {
             crate::tuple::Datum::Fixed(v) | crate::tuple::Datum::Var(v) => v,
             other => bail!("array element {i} decoded as {other:?}, which cannot appear in an array"),
         };
-        let wire = to_send_format(&elem.typname, bytes)?;
+        let wire = send(cat, elem.oid, bytes)?;
         out.i32(wire.len() as i32).bytes(&wire);
     }
     Ok(out.0)
@@ -349,6 +418,19 @@ pub fn to_send_format(typname: &str, b: &[u8]) -> Result<Vec<u8>> {
         }
         "int2" => swap(2)?,
         "int4" | "oid" | "float4" | "date" => swap(4)?,
+        t if REG.contains(&t) => swap(4)?,
+        "inet" | "cidr" => {
+            // On disk: family, bits, address. inet_send adds is_cidr and the
+            // address length between them and the address.
+            ensure!(
+                b.len() == 6 || b.len() == 18,
+                "{typname} datum is {} bytes, expected 6 or 18",
+                b.len()
+            );
+            let mut o = vec![b[0], b[1], u8::from(typname == "cidr"), (b.len() - 2) as u8];
+            o.extend_from_slice(&b[2..]);
+            o
+        }
         "int8" | "float8" | "time" | "timestamp" | "timestamptz" => swap(8)?,
         "interval" => {
             // struct Interval { TimeOffset time; int32 day; int32 month }

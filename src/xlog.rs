@@ -120,7 +120,13 @@ pub struct SegmentDir {
     /// long to wait before asking for it again.
     last_miss: Option<(String, Instant, Duration)>,
     restore_command: Option<String>,
+    /// Source conninfo to run `pg_switch_wal()` against, and when we last did.
+    switch_wal: Option<(String, Option<Instant>)>,
 }
+
+/// At most one forced switch this often: each one closes a segment early, and
+/// the archive keeps every one of them.
+const SWITCH_WAL_EVERY: Duration = Duration::from_secs(30);
 
 const FETCH_RETRY_MIN: Duration = Duration::from_secs(1);
 const FETCH_RETRY_MAX: Duration = Duration::from_secs(30);
@@ -195,6 +201,7 @@ impl SegmentDir {
             cache: HashMap::new(),
             last_miss: None,
             restore_command: None,
+            switch_wal: None,
         }
     }
 
@@ -204,6 +211,35 @@ impl SegmentDir {
     pub fn with_restore_command(mut self, cmd: Option<String>) -> Self {
         self.restore_command = cmd;
         self
+    }
+
+    /// On a miss, ask the source to close the segment we are waiting for.
+    pub fn with_switch_wal(mut self, source: Option<String>) -> Self {
+        self.switch_wal = source.map(|c| (c, None));
+        self
+    }
+
+    /// The segment still being written is never archived until it fills or
+    /// archive_timeout passes -- and at shutdown, never. Switching closes it so
+    /// the archiver ships it now. Only that segment: an older miss is archiver
+    /// lag, which switching cannot help.
+    fn switch_wal(&mut self, name: &str) {
+        let Some((conninfo, last)) = &mut self.switch_wal else { return };
+        if last.is_some_and(|t| t.elapsed() < SWITCH_WAL_EVERY) {
+            return;
+        }
+        *last = Some(Instant::now());
+        let sql = format!(
+            "select pg_switch_wal() where pg_walfile_name(pg_current_wal_lsn()) = '{name}'"
+        );
+        let ok = std::process::Command::new("psql")
+            .args(["-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-d", conninfo, "-c", &sql])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("pgs3: warning: pg_switch_wal() on the source failed while waiting for {name}");
+        }
     }
 
     /// Fetch `name` into `dest` from the archive. Returns Ok(false) rather than
@@ -248,6 +284,7 @@ impl SegmentDir {
             self.last_miss = None;
             return Ok(true);
         }
+        self.switch_wal(name);
         let prev =
             self.last_miss.as_ref().filter(|(n, _, _)| n == name).map(|(_, _, wait)| *wait);
         self.last_miss = Some((name.to_string(), Instant::now(), next_wait(prev)));
@@ -258,13 +295,21 @@ impl SegmentDir {
         if !self.cache.contains_key(&segno) {
             let name = crate::lsn::segment_name(tli, segno, seg_size);
             let path = self.dir.join(&name);
-            if !path.exists() && !self.fetch(&name, &path)? {
+            let fetched = !path.exists();
+            if fetched && !self.fetch(&name, &path)? {
                 // Not on disk and the archive fetcher couldn't get it either:
                 // treat exactly
                 // like a missing file below, since we only ever read forward.
                 return Err(anyhow::Error::new(SegmentUnavailable(name)));
             }
-            let bytes = match std::fs::read(&path) {
+            let read = std::fs::read(&path);
+            // ponytail: fetched segments are dropped once read so the cache
+            // cannot grow the disk the way a slot does; a reconnect re-fetches
+            // from the archive. Keep a bounded window if that gets slow.
+            if fetched {
+                let _ = std::fs::remove_file(&path);
+            }
+            let bytes = match read {
                 Ok(b) => b,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return Err(anyhow::Error::new(SegmentUnavailable(name)));

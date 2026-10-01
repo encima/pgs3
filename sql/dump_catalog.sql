@@ -11,6 +11,11 @@ select json_build_object(
   'server_version_num', (select setting::int from pg_settings where name = 'server_version_num'),
   'system_identifier', (select system_identifier::text from pg_control_system()),
   'captured_at_lsn', pg_current_wal_lsn()::text,
+  'timeline_id', (select timeline_id from pg_control_checkpoint()),
+  -- restart_lsn of the temporary slot `pgs3 init` creates in this session: the
+  -- point from which every later commit decodes completely. Null otherwise.
+  'start_lsn', (select restart_lsn::text from pg_replication_slots
+                where slot_name = 'pgs3_init_' || pg_backend_pid()),
   -- Relfilenodes of the catalogs that define a relation's rowtype. Writes to
   -- these are what can invalidate the frozen dictionary. Captured rather than
   -- assumed, because these are mapped relations whose filenode changes if the
@@ -18,7 +23,50 @@ select json_build_object(
   'rowtype_catalogs', json_build_object(
      'pg_class',     pg_relation_filenode('pg_catalog.pg_class')::bigint,
      'pg_attribute', pg_relation_filenode('pg_catalog.pg_attribute')::bigint),
-  'relations',      coalesce(json_agg(r order by r->>'relfilenode'), '[]'::json)
+  'relations',      coalesce(json_agg(r order by r->>'relfilenode'), '[]'::json),
+  -- Every type a published value can contain, so the encoder can produce its
+  -- send() form: array elements, domain bases and composite attributes,
+  -- followed recursively.
+  'types', (
+    with recursive reach(oid) as (
+      select a.atttypid
+      from pg_publication_tables pt
+      join pg_namespace n on n.nspname = pt.schemaname
+      join pg_class c     on c.relnamespace = n.oid and c.relname = pt.tablename
+      join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+      where pt.pubname = :'pubname'
+      union
+      select x.oid
+      from reach
+      join pg_type ty on ty.oid = reach.oid
+      cross join lateral (
+        select ty.typelem where ty.typelem <> 0 and ty.typlen = -1
+        union all
+        select ty.typbasetype where ty.typtype = 'd'
+        union all
+        select a.atttypid from pg_attribute a
+        where ty.typtype = 'c' and a.attrelid = ty.typrelid and a.attnum > 0 and not a.attisdropped
+      ) x(oid)
+    )
+    select coalesce(json_agg(json_build_object(
+      'oid',      ty.oid::bigint,
+      'typname',  ty.typname,
+      'typtype',  ty.typtype,
+      'typlen',   ty.typlen,
+      'typalign', ty.typalign,
+      'elem',     case when ty.typelem <> 0 and ty.typlen = -1 then ty.typelem::bigint end,
+      'basetype', case when ty.typtype = 'd' then ty.typbasetype::bigint end,
+      'labels',   case when ty.typtype = 'e' then (
+                    select json_agg(json_build_array(e.oid::bigint, e.enumlabel) order by e.enumsortorder)
+                    from pg_enum e where e.enumtypid = ty.oid) end,
+      'attrs',    case when ty.typtype = 'c' then (
+                    select json_agg(json_build_object(
+                             'atttypid', a.atttypid::bigint, 'attlen', a.attlen,
+                             'attalign', a.attalign, 'attisdropped', a.attisdropped) order by a.attnum)
+                    from pg_attribute a where a.attrelid = ty.typrelid and a.attnum > 0) end
+    ) order by ty.oid), '[]'::json)
+    from reach join pg_type ty on ty.oid = reach.oid
+  )
 )
 from (
   select json_build_object(
@@ -61,7 +109,12 @@ from (
       left join lateral (
         select true as iskey
         from pg_index i
-        where i.indrelid = c.oid and i.indisreplident
+        -- DEFAULT identity is the primary key; indisreplident is only set by
+        -- REPLICA IDENTITY USING INDEX.
+        where i.indrelid = c.oid
+          and case c.relreplident when 'd' then i.indisprimary
+                                  when 'i' then i.indisreplident
+                                  else false end
           and a.attnum = any (i.indkey::smallint[])
         limit 1
       ) k on true
@@ -69,9 +122,11 @@ from (
       where a.attrelid = c.oid and a.attnum > 0
     )
   ) as r
-  from pg_publication_rel pr
-  join pg_class c     on c.oid = pr.prrelid
-  join pg_namespace n on n.oid = c.relnamespace
-  join pg_publication p on p.oid = pr.prpubid
-  where p.pubname = :'pubname'
+  -- pg_publication_tables, not pg_publication_rel: the latter is empty for
+  -- FOR ALL TABLES and lists partitioned roots rather than the leaves whose
+  -- relfilenodes actually appear in WAL.
+  from pg_publication_tables pt
+  join pg_namespace n on n.nspname = pt.schemaname
+  join pg_class c     on c.relnamespace = n.oid and c.relname = pt.tablename
+  where pt.pubname = :'pubname'
 ) s;
