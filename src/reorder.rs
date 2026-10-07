@@ -1,9 +1,9 @@
 //! Reorder buffer: WAL interleaves transactions, logical replication does not.
 //!
 //! Buffer changes per writing xid, collect TOAST chunks alongside them, merge
-//! subtransactions at commit, and emit in commit order once the commit record
-//! arrives. Aborted transactions -- and subtransactions the commit record does
-//! not list -- are dropped without ever being emitted.
+//! the subtransactions the commit record lists, and emit in commit order once
+//! that record arrives. Aborted transactions and rolled-back savepoints are
+//! dropped at their own ABORT record without ever being emitted.
 
 use crate::catalog::{Catalog, Relation};
 use crate::lsn::Lsn;
@@ -65,7 +65,6 @@ struct Xact {
 pub struct ReorderBuffer<'a> {
     cat: &'a Catalog,
     xacts: HashMap<u32, Xact>,
-    subxact_to_top: HashMap<u32, u32>,
     /// Refuse when DDL touches a published relation after T0.
     pub strict_ddl: bool,
     /// Catalog deletes cannot be attributed to a relation; warn once, not once
@@ -78,7 +77,6 @@ impl<'a> ReorderBuffer<'a> {
         ReorderBuffer {
             cat,
             xacts: HashMap::new(),
-            subxact_to_top: HashMap::new(),
             strict_ddl: true,
             warned_catalog_delete: false,
         }
@@ -87,15 +85,6 @@ impl<'a> ReorderBuffer<'a> {
     pub fn feed(&mut self, r: &Record) -> Result<Vec<Event<'a>>> {
         match r.rmid {
             RM_HEAP_ID | RM_HEAP2_ID => {
-                // PG14+ tags the first record of a subtransaction with its
-                // top-level xid. Record the parentage so a rolled-back savepoint
-                // can be dropped at the top-level commit; attribution itself
-                // stays by writing xid until then.
-                if let Some(top) = r.toplevel_xid {
-                    if top != r.xid {
-                        self.subxact_to_top.insert(r.xid, top);
-                    }
-                }
                 // Catalog writes are checked from the raw record, before
                 // parse_heap discards them for lacking logical-decoding flags.
                 if let Some(b) = r.block(0) {
@@ -287,24 +276,11 @@ impl<'a> ReorderBuffer<'a> {
     fn feed_xact(&mut self, r: &Record) -> Result<Vec<Event<'a>>> {
         let op = r.info & 0x70;
         match op {
-            rmgr::XLOG_XACT_ASSIGNMENT => {
-                // Parentage only. Changes stay keyed by the writing xid and
-                // are merged at commit for exactly the subxacts the commit
-                // record lists, so a rolled-back savepoint is never emitted.
-                let (top, subs) = rmgr::parse_assignment(r)?;
-                for s in subs {
-                    self.subxact_to_top.insert(s, top);
-                }
-                Ok(Vec::new())
-            }
-
             rmgr::XLOG_XACT_ABORT | rmgr::XLOG_XACT_ABORT_PREPARED => {
                 let info = rmgr::parse_xact(r)?;
                 for x in info.subxacts.iter().chain(std::iter::once(&r.xid)) {
                     self.xacts.remove(x);
-                    self.subxact_to_top.remove(x);
                 }
-                self.forget_subxacts(r.xid, &[]);
                 Ok(Vec::new())
             }
 
@@ -319,7 +295,6 @@ impl<'a> ReorderBuffer<'a> {
                         }
                     }
                 }
-                self.forget_subxacts(r.xid, &info.subxacts);
                 if xact.changes.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -350,30 +325,6 @@ impl<'a> ReorderBuffer<'a> {
             }
 
             _ => Ok(Vec::new()),
-        }
-    }
-
-    /// Forget every subtransaction attributed to `top`. Those listed in the
-    /// xact record were merged at commit; anything else mapped to this top
-    /// (assignment record or PG14+ toplevel_xid tag) rolled back -- subxact
-    /// aborts write no WAL -- so its buffered changes are dropped and its
-    /// memory freed. Without this, exception-handler-heavy workloads grow the
-    /// buffer without bound and a recycled xid merges stale changes.
-    fn forget_subxacts(&mut self, top: u32, committed: &[u32]) {
-        // ponytail: linear `contains`; swap for a HashSet if commits with
-        // thousands of subxacts ever matter.
-        let dead: Vec<u32> = self
-            .subxact_to_top
-            .iter()
-            .filter(|(s, t)| **t == top && !committed.contains(s))
-            .map(|(s, _)| *s)
-            .collect();
-        for s in dead {
-            self.xacts.remove(&s);
-            self.subxact_to_top.remove(&s);
-        }
-        for s in committed {
-            self.subxact_to_top.remove(s);
         }
     }
 }

@@ -555,8 +555,6 @@ mod tests {
 
     #[test]
     fn option_survives_non_ascii_input() {
-        // to_lowercase() would turn the 2-byte İ into 3 bytes and shift the
-        // index used against the original string; ASCII folding keeps them in step.
         let sql = "START_REPLICATION SLOT \"İx\" LOGICAL 0/1 (binary 'true')";
         assert_eq!(option(sql, "binary"), Some("true"));
         assert_eq!(option(sql, "streaming"), None);

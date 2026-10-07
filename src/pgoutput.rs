@@ -238,7 +238,6 @@ fn tuple_data(cat: &Catalog, rel: &Relation, vals: &[Datum]) -> Result<Vec<u8>> 
     Ok(b.0)
 }
 
-/// Encode one column value: an array walk, or a plain scalar conversion.
 /// What type `oid`'s `send()` would emit for these on-disk bytes.
 pub fn send(cat: &Catalog, oid: u32, b: &[u8]) -> Result<Vec<u8>> {
     let t = cat.type_info(oid).with_context(|| format!("type {oid} missing from the dictionary"))?;

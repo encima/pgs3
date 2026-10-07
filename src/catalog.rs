@@ -16,17 +16,6 @@ use std::path::Path;
 /// Mirrors the columns of `pg_attribute` the decoder and the pgoutput encoder
 /// need. Fields are populated by serde from the dictionary even where only the
 /// encoder reads them.
-/// Element type of an array column: what the payload walk and the per-element
-/// encoder need.
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub struct ElemType {
-    pub oid: u32,
-    pub typname: String,
-    pub typlen: i16,
-    pub typalign: char,
-}
-
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct Column {
@@ -45,8 +34,6 @@ pub struct Column {
     pub attgenerated: String,
     pub typname: String,
     pub typnsp: String,
-    /// Present only for array columns.
-    pub elem: Option<ElemType>,
 }
 
 #[allow(dead_code)]
@@ -150,15 +137,14 @@ impl Catalog {
             for c in &r.columns {
                 anyhow::ensure!(!c.attname.contains('\0'), "{}.{}: NUL byte in column name", r.qualified_name(), c.attname);
                 anyhow::ensure!(c.attlen != 0, "{}.{}: attlen 0 would stall the tuple walk", r.qualified_name(), c.attname);
-                if let Some(e) = &c.elem {
-                    anyhow::ensure!(e.typlen != 0, "{}.{}: array element typlen 0 would stall the payload walk", r.qualified_name(), c.attname);
-                }
             }
         }
-        let mut seen = std::collections::HashSet::new();
         for (i, r) in cat.relations.iter().enumerate() {
-            anyhow::ensure!(seen.insert(r.relfilenode), "duplicate relfilenode {} in dictionary", r.relfilenode);
-            cat.by_relfilenode.insert(r.relfilenode, i);
+            anyhow::ensure!(
+                cat.by_relfilenode.insert(r.relfilenode, i).is_none(),
+                "duplicate relfilenode {} in dictionary",
+                r.relfilenode
+            );
             if let Some(t) = r.toast_relfilenode {
                 cat.by_toast_relfilenode.insert(t, i);
             }

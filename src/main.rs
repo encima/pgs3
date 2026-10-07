@@ -100,17 +100,35 @@ serve options:
         }
     });
 
-    // --restore-command wins over the env var; both are optional and fall back
-    // to wal-g inside SegmentDir when neither is set.
     let restore_command =
         get("--restore-command").or_else(|| std::env::var("PGS3_RESTORE_COMMAND").ok());
 
-    let src = xlog::SegmentDir::new(&wal).with_restore_command(restore_command.clone());
-    let mut reader = xlog::WalReader::new(src, tli, seg_size, start, end, version, sysid);
-    // serve checks per connection, waiting for the segment to be archived.
-    if mode != "serve" {
-        reader.verify_provenance()?;
+    // Serve a logical replication stream to a real subscriber. Each connection
+    // opens its own reader and waits for the start segment to be archived.
+    if mode == "serve" {
+        let cat = cat.as_ref().context("serve needs --catalog")?;
+        pgoutput::check_publication_encodable(cat)?;
+        let opts = walsender::Options {
+            wal_dir: wal.into(),
+            restore_command,
+            switch_wal_source: get("--source"),
+            tli,
+            seg_size,
+            version,
+            sysid,
+            start,
+            end,
+            strict_ddl: !args.iter().any(|a| a == "--allow-catalog-changes"),
+            confirmed_file: get("--confirmed-lsn-file").map(Into::into),
+            exit_when_caught_up: args.iter().any(|a| a == "--exit-when-caught-up"),
+        };
+        let addr = get("--listen").unwrap_or_else(|| "127.0.0.1:5439".into());
+        return walsender::serve(&addr, cat, opts);
     }
+
+    let src = xlog::SegmentDir::new(&wal).with_restore_command(restore_command);
+    let mut reader = xlog::WalReader::new(src, tli, seg_size, start, end, version, sysid);
+    reader.verify_provenance()?;
 
     match mode.as_str() {
         // Framing only: prove the reader agrees with pg_waldump record for record.
@@ -155,27 +173,6 @@ serve options:
                     }
                 }
             }
-        }
-        // Serve a logical replication stream to a real subscriber.
-        "serve" => {
-            let cat = cat.as_ref().context("serve needs --catalog")?;
-            pgoutput::check_publication_encodable(cat)?;
-            let opts = walsender::Options {
-                wal_dir: wal.clone().into(),
-                restore_command,
-                switch_wal_source: get("--source"),
-                tli,
-                seg_size,
-                version,
-                sysid,
-                start,
-                end,
-                strict_ddl: !args.iter().any(|a| a == "--allow-catalog-changes"),
-                confirmed_file: get("--confirmed-lsn-file").map(Into::into),
-                exit_when_caught_up: args.iter().any(|a| a == "--exit-when-caught-up"),
-            };
-            let addr = get("--listen").unwrap_or_else(|| "127.0.0.1:5439".into());
-            walsender::serve(&addr, cat, opts)?;
         }
         _ => anyhow::bail!(usage),
     }
@@ -223,7 +220,6 @@ fn init(get: &dyn Fn(&str) -> Option<String>, usage: &str) -> Result<()> {
         .as_mut()
         .context("piped stdin")?
         .write_all(sql.as_bytes())?;
-    drop(child.stdin.take()); // close stdin so psql runs the script
     let out = child.wait_with_output().context("running psql")?;
     anyhow::ensure!(
         out.status.success(),
@@ -243,7 +239,6 @@ fn init(get: &dyn Fn(&str) -> Option<String>, usage: &str) -> Result<()> {
     anyhow::ensure!(cat.start_lsn.is_some(), "the source returned no start LSN from the temporary slot");
     let Some(target) = target else { return Ok(()) };
 
-    // Schema copy: pg_dump --schema-only | psql.
     let dump = Command::new("pg_dump")
         .args(["--schema-only", "--no-owner", "--no-privileges", &source])
         .output()
@@ -263,7 +258,6 @@ fn init(get: &dyn Fn(&str) -> Option<String>, usage: &str) -> Result<()> {
         .as_mut()
         .context("piped stdin")?
         .write_all(&dump.stdout)?;
-    drop(child.stdin.take());
     let status = child.wait().context("applying the schema to the target")?;
     anyhow::ensure!(status.success(), "applying the schema to the target failed");
 

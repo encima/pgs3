@@ -106,9 +106,9 @@ update t set name = name || '!' where id between 100 and 300;
 begin;
 insert into t values (7,'gina',null,7.77,true,null,null,null,null,null,null,null);
 savepoint s1;
-insert into t values (8,'ghost-sub',null,8.88,false,null,null,null,null,null,null,null,null);
+insert into t values (8,'ghost-sub',null,8.88,false,null,null,null,null,null,null,null);
 rollback to savepoint s1;
-insert into t values (9,'survivor',null,9.99,true,null,null,null,null,null,null,null,null);
+insert into t values (9,'survivor',null,9.99,true,null,null,null,null,null,null,null);
 commit;
 EOF
 psql_ -c "select pg_switch_wal();" >/dev/null

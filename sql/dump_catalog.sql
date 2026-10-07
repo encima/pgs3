@@ -93,19 +93,11 @@ from (
                'attispkey',  coalesce(k.iskey, false),
                'attgenerated', a.attgenerated,
                'typname',    t.typname,
-               'typnsp',     tn.nspname,
-               -- Array element metadata, needed to walk the array's payload and
-               -- encode each element. Null for non-array columns.
-               'elem', case when t.typcategory = 'A' then json_build_object(
-                              'oid',      et.oid::bigint,
-                              'typname',  et.typname,
-                              'typlen',   et.typlen,
-                              'typalign', et.typalign) end
+               'typnsp',     tn.nspname
              ) order by a.attnum), '[]'::json)
       from pg_attribute a
       join pg_type t  on t.oid = a.atttypid
       join pg_namespace tn on tn.oid = t.typnamespace
-      left join pg_type et on et.oid = t.typelem
       left join lateral (
         select true as iskey
         from pg_index i

@@ -55,7 +55,7 @@ T1="insert into t values (1, 'aal1', '10.0.0.1', '10.0.0.0/8', 's', 5, array[('i
 p -c "insert into s values (1,'before init'); $T1" >/dev/null
 
 echo "==> init"
-PATH="$PATH" "$ROOT/target/debug/pgs3" init --source "host=$PSOCK port=$PPORT user=postgres dbname=postgres" \
+"$ROOT/target/debug/pgs3" init --source "host=$PSOCK port=$PPORT user=postgres dbname=postgres" \
   --catalog "$BASE/catalog.json" --publication ps 2>&1 | sed 's/^/    /'
 [ "$(p -c "select count(*) from pg_replication_slots;")" = 0 ] || fail "init left a slot behind"
 grep -q '"start_lsn" *: *"[0-9A-F]*/' "$BASE/catalog.json" || fail "no start_lsn in the dictionary"

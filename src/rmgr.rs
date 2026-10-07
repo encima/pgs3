@@ -16,7 +16,6 @@ pub const XLOG_XACT_COMMIT: u8 = 0x00;
 pub const XLOG_XACT_ABORT: u8 = 0x20;
 pub const XLOG_XACT_COMMIT_PREPARED: u8 = 0x30;
 pub const XLOG_XACT_ABORT_PREPARED: u8 = 0x40;
-pub const XLOG_XACT_ASSIGNMENT: u8 = 0x50;
 const XLOG_XACT_OPMASK: u8 = 0x70;
 const XLOG_XACT_HAS_INFO: u8 = 0x80;
 
@@ -176,17 +175,13 @@ pub fn parse_heap(r: &Record) -> Result<Option<(RelFileLocator, HeapOp)>> {
 /// registers no block reference. Returns (dbId, relIds).
 pub fn parse_truncate(r: &Record) -> Result<(u32, Vec<u32>)> {
     let md = &r.main_data;
-    // Oid dbId; Oid tsId; int nrelids; bool cascade; Oid relIds[]
-    ensure!(md.len() >= 16, "truncated xl_heap_truncate at {}", r.lsn);
+    // Oid dbId; uint32 nrelids; uint8 flags; (pad) Oid relids[]
+    ensure!(md.len() >= 12, "truncated xl_heap_truncate at {}", r.lsn);
     let db = u32::from_le_bytes(md[0..4].try_into()?);
-    let n = i32::from_le_bytes(md[8..12].try_into()?);
-    ensure!(n >= 0, "negative nrelids at {}", r.lsn);
-    let n = n as usize;
-    ensure!(md.len() >= 16 + 4 * n, "truncated relid list at {}", r.lsn);
-    let mut relids = Vec::with_capacity(n);
-    for i in 0..n {
-        relids.push(u32::from_le_bytes(md[16 + 4 * i..20 + 4 * i].try_into()?));
-    }
+    let n = u32::from_le_bytes(md[4..8].try_into()?) as usize;
+    // Bound the allocation by the bytes actually present before trusting n.
+    ensure!(md.len() >= 12 + 4 * n, "truncated relid list at {}", r.lsn);
+    let relids = md[12..12 + 4 * n].as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
     Ok((db, relids))
 }
 
@@ -291,59 +286,32 @@ pub fn parse_xact(r: &Record) -> Result<XactInfo> {
     Ok(info)
 }
 
-/// `XLOG_XACT_ASSIGNMENT` binds subtransactions to their top-level xid before
-/// commit, which matters when a subxact's changes must be attributed early.
-pub fn parse_assignment(r: &Record) -> Result<(u32, Vec<u32>)> {
-    let md = &r.main_data;
-    ensure!(md.len() >= 8, "truncated xl_xact_assignment at {}", r.lsn);
-    let top = u32::from_le_bytes(md[0..4].try_into()?);
-    let n = i32::from_le_bytes(md[4..8].try_into()?);
-    ensure!(n >= 0, "negative subxact count at {}", r.lsn);
-    let n = n as usize;
-    // Bound the allocation by the bytes actually present before trusting n.
-    ensure!(md.len() >= 8 + 4 * n, "truncated assignment list at {}", r.lsn);
-    let mut subs = Vec::with_capacity(n);
-    for i in 0..n {
-        let o = 8 + 4 * i;
-        subs.push(u32::from_le_bytes(md[o..o + 4].try_into()?));
-    }
-    Ok((top, subs))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::lsn::Lsn;
-    use crate::xlog::{Record, RM_HEAP_ID, RM_XACT_ID};
+    use crate::xlog::{Record, RM_HEAP_ID};
 
     fn rec(rmid: u8, info: u8, main_data: Vec<u8>) -> Record {
         Record {
             lsn: Lsn(0), end_lsn: Lsn(0), tot_len: 0, xid: 1, rmid, info,
-            main_data, blocks: Vec::new(), toplevel_xid: None,
+            main_data, blocks: Vec::new(),
         }
     }
 
     #[test]
     fn truncate_relids_come_from_main_data() {
         let mut md = Vec::new();
-        md.extend_from_slice(&999u32.to_le_bytes());
-        md.extend_from_slice(&0u32.to_le_bytes());
-        md.extend_from_slice(&2i32.to_le_bytes());
-        md.resize(16, 0);
+        md.extend_from_slice(&999u32.to_le_bytes()); // dbId
+        md.extend_from_slice(&2u32.to_le_bytes()); // nrelids
+        md.extend_from_slice(&[1, 0xAA, 0xAA, 0xAA]); // flags + uninitialised padding
         md.extend_from_slice(&16384u32.to_le_bytes());
         md.extend_from_slice(&16385u32.to_le_bytes());
         let (db, relids) = parse_truncate(&rec(RM_HEAP_ID, XLOG_HEAP_TRUNCATE, md)).unwrap();
         assert_eq!((db, relids), (999, vec![16384, 16385]));
-        // A negative count is an error, not a huge allocation.
-        let mut bad = vec![0u8; 16];
-        bad[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+        // A count the bytes cannot back is an error, not a huge allocation.
+        let mut bad = vec![0u8; 12];
+        bad[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(parse_truncate(&rec(RM_HEAP_ID, XLOG_HEAP_TRUNCATE, bad)).is_err());
-    }
-
-    #[test]
-    fn assignment_rejects_a_negative_subxact_count() {
-        let mut md = vec![0u8; 8];
-        md[4..8].copy_from_slice(&(-1i32).to_le_bytes());
-        assert!(parse_assignment(&rec(RM_XACT_ID, XLOG_XACT_ASSIGNMENT, md)).is_err());
     }
 }

@@ -76,7 +76,6 @@ pub struct Record {
     pub info: u8,
     pub main_data: Vec<u8>,
     pub blocks: Vec<BlockRef>,
-    pub toplevel_xid: Option<u32>,
 }
 
 impl Record {
@@ -298,8 +297,8 @@ impl SegmentDir {
             let fetched = !path.exists();
             if fetched && !self.fetch(&name, &path)? {
                 // Not on disk and the archive fetcher couldn't get it either:
-                // treat exactly
-                // like a missing file below, since we only ever read forward.
+                // treat exactly like a missing file below, since we only ever
+                // read forward.
                 return Err(anyhow::Error::new(SegmentUnavailable(name)));
             }
             let read = std::fs::read(&path);
@@ -568,7 +567,7 @@ impl WalReader {
         ensure!(computed == crc, "CRC mismatch at {start}: got {computed:#x}, want {crc:#x}");
 
         let end_lsn = Lsn(maxalign(self.pos.0));
-        let (main_data, blocks, toplevel_xid) = parse_record_body(&body, start, self.version)?;
+        let (main_data, blocks) = parse_record_body(&body, start, self.version)?;
 
         // After a switch the remainder of the segment is zero padding. Jump to
         // the next segment rather than trying to parse it.
@@ -577,7 +576,7 @@ impl WalReader {
             self.pos = Lsn((segno + 1) * self.seg_size);
         }
 
-        Ok(Some(Record { lsn: start, end_lsn, tot_len: tot_len as u32, xid, rmid, info, main_data, blocks, toplevel_xid }))
+        Ok(Some(Record { lsn: start, end_lsn, tot_len: tot_len as u32, xid, rmid, info, main_data, blocks }))
     }
 }
 
@@ -588,7 +587,7 @@ fn parse_record_body(
     body: &[u8],
     lsn: Lsn,
     version: PgVersion,
-) -> Result<(Vec<u8>, Vec<BlockRef>, Option<u32>)> {
+) -> Result<(Vec<u8>, Vec<BlockRef>)> {
     struct Pending {
         id: u8,
         fork_flags: u8,
@@ -599,13 +598,12 @@ fn parse_record_body(
 
     // Records such as XLOG_SWITCH have no block references and no main data.
     if body.is_empty() {
-        return Ok((Vec::new(), Vec::new(), None));
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let mut p = 0usize;
     let mut pending: Vec<Pending> = Vec::new();
     let mut main_len: usize = 0;
-    let mut toplevel_xid = None;
     let mut last_rlocator = RelFileLocator::default();
     // Running total of payload bytes the headers have promised. The header
     // section ends when the bytes left equal that total -- NOT when a
@@ -639,7 +637,7 @@ fn parse_record_body(
                 let _origin = u16::from_le_bytes(take!(2).try_into()?);
             }
             XLR_BLOCK_ID_TOPLEVEL_XID => {
-                toplevel_xid = Some(u32::from_le_bytes(take!(4).try_into()?));
+                take!(4);
             }
             id if id <= XLR_MAX_BLOCK_ID => {
                 let h = take!(3);
@@ -705,7 +703,7 @@ fn parse_record_body(
         });
     }
     let main_data = take!(main_len).to_vec();
-    Ok((main_data, blocks, toplevel_xid))
+    Ok((main_data, blocks))
 }
 
 
