@@ -23,6 +23,9 @@ fn main() -> Result<()> {
                  [--catalog <file>] [--server-version <num>] [--tli <n>] \
                  [--wal-segment-size <bytes>] [--allow-catalog-changes] \
                  [--restore-command <cmd>]
+       pgs3 --config <file.yaml> [options]
+
+    --config <file.yaml>      YAML defaults for any option; CLI args override.
 
 init captures the catalog dictionary from the source at T0, with a consistent
 start LSN and timeline taken from a temporary logical slot, and with --target
@@ -46,8 +49,25 @@ serve options:
                                being written is what we are waiting for
 ";
     let mode = args.get(1).cloned().unwrap_or_default();
+
+    // YAML config file: --config <path>. Values are defaults; CLI args override.
+    let config_path = args.iter().position(|a| a == "--config")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let config: std::collections::HashMap<String, String> = match config_path {
+        Some(path) => serde_yaml::from_str(&std::fs::read_to_string(&path)?)
+            .with_context(|| format!("parsing {}", path))?,
+        None => Default::default(),
+    };
     let get = |k: &str| -> Option<String> {
-        args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
+        args.iter().position(|a| a == k)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .or_else(|| config.get(k).cloned())
+            .or_else(|| config.get(&k.trim_start_matches("--")).cloned())
+    };
+    let flag = |args: &[String], cfg: &std::collections::HashMap<String, String>, k: &str| -> bool {
+        args.iter().any(|a| a == k) || cfg.get(k).map(|v| v == "true").unwrap_or(false)
     };
     if mode == "init" {
         return init(&get, usage);
@@ -103,6 +123,24 @@ serve options:
     let restore_command =
         get("--restore-command").or_else(|| std::env::var("PGS3_RESTORE_COMMAND").ok());
 
+    // Pre-flight check: validate everything without starting a stream.
+    if mode == "check" {
+        let cat = match &cat {
+            Some(c) => c,
+            None => anyhow::bail!("check needs --catalog\n\n{usage}"),
+        };
+        pgoutput::check_publication_encodable(cat)?;
+        let src = xlog::SegmentDir::new(&wal).with_restore_command(restore_command);
+        let mut reader = xlog::WalReader::new(src, tli, seg_size, start, end, version, sysid);
+        reader.verify_provenance()?;
+        eprintln!(
+            "pgs3: check OK — catalog has {} published relation(s), WAL provenance matches, \
+             all types encodable. Ready to serve.",
+            cat.relations.len()
+        );
+        return Ok(());
+    }
+
     // Serve a logical replication stream to a real subscriber. Each connection
     // opens its own reader and waits for the start segment to be archived.
     if mode == "serve" {
@@ -118,9 +156,10 @@ serve options:
             sysid,
             start,
             end,
-            strict_ddl: !args.iter().any(|a| a == "--allow-catalog-changes"),
+            strict_ddl: !flag(&args, &config, "--allow-catalog-changes"),
             confirmed_file: get("--confirmed-lsn-file").map(Into::into),
-            exit_when_caught_up: args.iter().any(|a| a == "--exit-when-caught-up"),
+            exit_when_caught_up: flag(&args, &config, "--exit-when-caught-up"),
+            status_file: get("--status-file").map(Into::into),
         };
         let addr = get("--listen").unwrap_or_else(|| "127.0.0.1:5439".into());
         return walsender::serve(&addr, cat, opts);
@@ -149,7 +188,7 @@ serve options:
         "decode" => {
             let cat = cat.as_ref().context("decode needs --catalog")?;
             let mut rb = reorder::ReorderBuffer::new(cat);
-            rb.strict_ddl = !args.iter().any(|a| a == "--allow-catalog-changes");
+            rb.strict_ddl = !flag(&args, &config, "--allow-catalog-changes");
             while let Some(r) = reader.next_record()? {
                 for e in rb.feed(&r)? {
                     if let Some(line) = reorder::render(&e) {
@@ -164,7 +203,7 @@ serve options:
             let cat = cat.as_ref().context("pgoutput needs --catalog")?;
             pgoutput::check_publication_encodable(cat)?;
             let mut rb = reorder::ReorderBuffer::new(cat);
-            rb.strict_ddl = !args.iter().any(|a| a == "--allow-catalog-changes");
+            rb.strict_ddl = !flag(&args, &config, "--allow-catalog-changes");
             let mut enc = pgoutput::Encoder::new(cat);
             while let Some(r) = reader.next_record()? {
                 for e in rb.feed(&r)? {

@@ -41,6 +41,9 @@ pub struct Options {
     pub confirmed_file: Option<PathBuf>,
     /// Exit once the subscriber has confirmed everything we decoded.
     pub exit_when_caught_up: bool,
+    /// Where to periodically write a JSON status snapshot for external
+    /// monitoring (healthchecks, systemd, k8s probes).
+    pub status_file: Option<PathBuf>,
 }
 
 struct Conn {
@@ -158,9 +161,20 @@ impl Conn {
     }
 }
 
+fn write_status(opts: &Options, state: &str, lsn: Lsn, confirmed: Lsn) {
+    let Some(path) = &opts.status_file else { return };
+    let json = format!(
+        r#"{{"state":"{state}","lsn":"{lsn}","confirmed":"{confirmed}"}}"#
+    );
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::write(&tmp, json);
+    let _ = std::fs::rename(&tmp, path);
+}
+
 pub fn serve(addr: &str, cat: &Catalog, opts: Options) -> Result<()> {
     let listener = TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
     eprintln!("pgs3: listening on {}", listener.local_addr()?);
+    write_status(&opts, "waiting", opts.start, Lsn(0));
 
     // An apply worker restarts and reconnects after any error, so one
     // connection is never enough. In catch-up mode we stop as soon as the
@@ -174,9 +188,13 @@ pub fn serve(addr: &str, cat: &Catalog, opts: Options) -> Result<()> {
                     return Ok(());
                 }
                 eprintln!("pgs3: subscriber disconnected; waiting for it to come back");
+                write_status(&opts, "waiting", opts.start, Lsn(0));
             }
             Err(e) if opts.exit_when_caught_up => return Err(e),
-            Err(e) => eprintln!("pgs3: connection failed: {e:#}"),
+            Err(e) => {
+                eprintln!("pgs3: connection failed: {e:#}");
+                write_status(&opts, "error", opts.start, Lsn(0));
+            }
         }
     }
 }
@@ -423,6 +441,7 @@ fn stream(conn: &mut Conn, sql: &str, cat: &Catalog, opts: &Options) -> Result<b
     let mut sent_msgs = 0u64;
     let mut announced_drain = false;
 
+    let mut last_status = Instant::now();
     loop {
         // Client feedback first: it drives both the confirmed-LSN file and the
         // decision to stop.
@@ -485,9 +504,16 @@ fn stream(conn: &mut Conn, sql: &str, cat: &Catalog, opts: &Options) -> Result<b
             }
         }
 
+        // Throttled status update during streaming (at most once per second).
+        if last_status.elapsed() >= Duration::from_secs(1) {
+            last_status = Instant::now();
+            write_status(opts, "streaming", last_commit_end, confirmed);
+        }
+
         // Nothing left to decode: nudge the subscriber for feedback.
         keepalive(conn, last_commit_end, true)?;
         if confirmed >= last_commit_end {
+            write_status(opts, "caught_up", last_commit_end, confirmed);
             if opts.exit_when_caught_up {
                 eprintln!("pgs3: subscriber confirmed {confirmed}; caught up");
                 return Ok(true);
