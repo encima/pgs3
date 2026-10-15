@@ -85,12 +85,12 @@ Output half — done and verified:
 | Advancer | `scripts/advance-slot.sh`, driven by the confirmed-LSN file |
 
 Types: `bool bytea char name int2 int4 int8 oid float4 float8 text varchar
-bpchar json jsonb numeric uuid date time timestamp timestamptz interval`, and
-arrays of any of them. Anything else is refused when the stream starts, naming
-the column.
+bpchar json jsonb numeric uuid date time timestamp timestamptz interval inet
+cidr` and the `reg*` types, plus enums, domains, composites and arrays of any of
+them. Anything else is refused when the stream starts, naming the column.
 
 Not implemented: streaming of in-progress transactions, two-phase commit, and
-composite/range/geometric types. Each is refused explicitly rather than
+range/multirange/geometric types. Each is refused explicitly rather than
 mis-encoded.
 
 ## Building and testing
@@ -102,66 +102,91 @@ cargo test                 # unit tests, no Postgres needed
 
 End-to-end checks need a real Postgres in `PATH` (`initdb`, `pg_ctl`, `psql`):
 `scripts/check.sh` builds a throwaway cluster and diffs `pgs3` against Postgres'
-own logical decoding; `scripts/check-all.sh` runs it for every major in the nix
+own logical decoding; `scripts/check-simdu.sh` runs the slotless init/serve/subscribe
+flow against a real subscriber; `scripts/check-all.sh` runs the checks for every major in the nix
 store. `devbox.json` provides the toolchain plus wal-g/minio for
 `scripts/minio-demo.sh`.
 
 ## Using it
 
-### Primary
+You need: `psql` wherever you run `init` and `subscribe`, a primary with
+`wal_level = logical` and `archive_mode = on` shipping WAL somewhere, and one
+command that can fetch a single segment from there (`%f` = segment name, `%p` =
+destination), e.g. `aws s3 cp s3://bucket/wal/%f %p` or `wal-g wal-fetch %f %p`.
 
-- One-shot bootstrap: capture the dictionary at T0 with a consistent start LSN
-  and timeline (needs `psql` in `PATH`):
-  - `./pgs3 init --source 'host=primary dbname=yourdb' --catalog catalog.json [--publication p]`
-  - The start LSN is the `restart_lsn` of a temporary logical slot, which is
-    dropped when init exits: nothing is left on the primary to retain WAL.
-  - Add `--target 'host=replica dbname=yourdb'` to also copy the schema there
-    (needs `pg_dump`). The dictionary is validated before the target is touched.
-  - From T0 on, no DDL (and no TRUNCATE) on published tables.
-- Or capture just the dictionary by hand (then pass `--start` to serve):
-  - `psql -X -t -A -v pubname=p -f sql/dump_catalog.sql > catalog.json`
+### Quick start
 
-### PGS3 Host
-
-- Tell pgs3 how to fetch missing segments from the archive, either way:
-  - any archive tool, PostgreSQL-style (`%f` = segment name, `%p` = local
-    destination path):
-    - `--restore-command 'pgbackrest --stanza=main archive-get %f %p'` (or
-      `export PGS3_RESTORE_COMMAND='wal-g wal-fetch %f %p'`, barman, `aws s3 cp`,
-      `cp` from NFS — whatever restores one segment)
-  - or wal-g's own env config, which is the implicit default fetcher:
-    - `export PGS3_WALG_CONFIG=/etc/wal-g/config.json`
-- Run PGS3
-  - `./pgs3 serve --wal /tmp/walcache --catalog catalog.json --listen 127.0.0.1:5439 --confirmed-lsn-file /run/pgs3.lsn --source 'host=primary dbname=yourdb'`
-  - `--start` and `--tli` default to what init recorded; `--end` to never.
-  - `--source` lets pgs3 run `pg_switch_wal()` (at most every 30s) when the
-    segment it is waiting on is the one the primary is still writing, so the
-    tail reaches the archive without waiting for `archive_timeout`.
-  - Fetched segments are deleted once read.
-
-### Subscriber
-
-The subscription is created against the **primary**, not against `pgs3`, and
-that is the same T0 the dictionary is captured at. Creating it there is what
-fills `pg_subscription_rel`, and the apply worker only applies changes for
-relations listed in it.
-
-```sql
-CREATE SUBSCRIPTION sub
-  CONNECTION 'host=primary dbname=yourdb'
-  PUBLICATION pub
-  WITH (binary = true, streaming = off, copy_data = false, slot_name = 'sub');
+```
+scripts/quickstart.sh 'host=primary dbname=app' \
+    --restore-command 'wal-g wal-fetch %f %p'
 ```
 
-Then the upgrade window opens. Disable it, take the slot's `restart_lsn` as
-`--start`, and repoint it at `pgs3` once the replica is back.
+This builds pgs3, creates publication `p` (`FOR ALL TABLES`) if it is missing,
+captures the dictionary, checks the archive, starts `serve` in the background,
+and prints the `subscribe` command to run once the replica is ready. Everything
+goes in `./pgs3-state/`, including a `config.yaml` that every `pgs3` command
+accepts with `--config`. `scripts/quickstart.sh stop` stops it.
+
+### The three commands
+
+```
+# 1. T0, on the primary: capture the dictionary and the start LSN. A temporary
+#    slot is used and dropped -- nothing is left behind to retain WAL.
+#    From here on: no DDL or TRUNCATE on published tables.
+pgs3 init --source 'host=primary dbname=app' --catalog catalog.json --publication p
+
+# 2. Serve the archive. The --wal directory is a cache, created if missing,
+#    and each segment is deleted once read. --source is optional: with it, pgs3
+#    runs pg_switch_wal() (at most every 30s) when the segment it waits on is
+#    the one still being written.
+pgs3 serve --catalog catalog.json --wal /var/lib/pgs3/wal \
+    --restore-command 'wal-g wal-fetch %f %p' \
+    --listen 0.0.0.0:5439 --status-file /var/lib/pgs3/status.json \
+    --source 'host=primary dbname=app'
+
+# 3. On the replica, once its data is consistent at some LSN X >= the start
+#    LSN init printed: subscribe it to pgs3 from X.
+pgs3 subscribe --target 'host=replica dbname=app' \
+    --source 'host=primary dbname=app' --publication p \
+    --at X --connect 'host=pgs3-host port=5439' --catalog catalog.json
+```
+
+`subscribe` creates the subscription against the primary with
+`create_slot = false` (that is what fills `pg_subscription_rel`; see below),
+sets its replication origin to X, points it at pgs3 and enables it. No slot is
+created on the primary, ever. For a replica made by copying the primary's volume
+and running `pg_upgrade`, X is `Latest checkpoint location` from `pg_controldata`
+of the copy, taken before upgrading it.
+
+Every option can live in a YAML file instead (`pgs3 serve --config pgs3.yaml`),
+with keys spelled like the options: `wal: /var/lib/pgs3/wal`,
+`restore-command: ...`, `exit-when-caught-up: true`. Command-line options win.
+Misspelled options and keys are errors. `pgs3 check` runs the same validation as
+`serve` without listening. `pgs3 help` lists everything.
+
+Without `--restore-command` (or `PGS3_RESTORE_COMMAND`), pgs3 calls
+`wal-g wal-fetch` itself when `PGS3_WALG_CONFIG` or `WALG_S3_PREFIX` is set.
+Otherwise segments must already be in `--wal`.
+
+### Alternative: keep a slot and advance it
+
+If the replica already has a subscription with a slot on the primary, keep it:
+disable the subscription, start `serve` with `--start` set to the slot's
+`restart_lsn` (not `confirmed_flush_lsn`) and with `--confirmed-lsn-file`, then
+repoint the subscription at pgs3 and run `scripts/advance-slot.sh` against the
+primary so the slot follows what the subscriber confirms:
 
 ```sql
 ALTER SUBSCRIPTION sub DISABLE;
 -- ... the upgrade ...
-ALTER SUBSCRIPTION sub CONNECTION 'host=127.0.0.1 port=5439 dbname=yourdb';
+ALTER SUBSCRIPTION sub CONNECTION 'host=pgs3-host port=5439 dbname=app';
 ALTER SUBSCRIPTION sub ENABLE;
 ```
+
+The subscription must be `binary = true, streaming = off`. `docker/compose.yaml`
+and `scripts/minio-demo.sh` walk through this shape end to end.
+
+### Why the subscription is created against the primary
 
 Creating the subscription against `pgs3` directly with `connect = false` looks
 shorter and is a trap. It leaves `pg_subscription_rel` empty, and the only way
@@ -172,14 +197,13 @@ the subscriber even confirms the LSN, and every change is discarded. The
 signature is `pg_replication_origin_status.remote_lsn` stuck at `0/0` while
 rows never arrive.
 
-
 ## Deliberate limits
 
 - **Types are an allowlist**, enforced when the stream starts, never mid-
   transaction, with the offending column named. Binary mode makes most types a
   byteswap; `numeric` is a repacking; `jsonb` needs a full `jsonb_out` (its
   binary form *is* the text rendering), which is why `numeric_out` is in here
-  too. Composite, range and geometric types are still refused.
+  too. Range, multirange and geometric types are still refused.
 - **TRUNCATE of a published table stops the stream.** Truncate assigns a new
   relfilenode — to the table and its TOAST — which the frozen dictionary cannot
   follow; rows written afterwards would be silently dropped. The decoder
@@ -198,9 +222,10 @@ rows never arrive.
   `barman-wal-restore`, or `cp /mnt/nfs/%f %p` all work; the tool itself owns
   creds, layout, compression and encryption. Without one, `SegmentDir` falls
   back to `wal-g wal-fetch` when `WALG_S3_PREFIX`/`PGS3_WALG_CONFIG` are set.
-  Either way, a segment that
-  isn't available yet is treated as "not archived yet" and retried, which is
-  what lets `serve` follow a live archive. Repeat misses on the *same* segment
+  Either way, a segment that isn't available yet is treated as "not archived yet" and retried, which is
+  what lets `serve` follow a live archive. Each wait is logged once; a
+  fetcher that cannot run at all (exit 126/127) is an error, not a wait.
+  Repeat misses on the *same* segment
   back off from 1s to 30s, so waiting at the head of the archive costs a couple
   of fetcher invocations a minute rather than one per poll; any other segment is
   fetched immediately, so catch-up still reads at full speed.

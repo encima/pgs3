@@ -16,7 +16,7 @@ for entry in "${BINS[@]}"; do
   PORT=$((PORT+10))
   echo
   ok=1
-  for script in check.sh check-subscriber.sh; do
+  for script in check.sh check-subscriber.sh check-simdu.sh; do
     PGS3_PG_BIN="$bin" PGS3_CHECK_PORT="$PORT" "$ROOT/scripts/$script" 2>&1 \
       | grep -vE '^initdb:|^NOTICE:' || ok=0
   done

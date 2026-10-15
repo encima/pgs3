@@ -71,20 +71,18 @@ s -c "insert into s values (1,'before init'), (2,'after init, before X'); $T1" >
 wait "$STRADDLE"
 echo "    X = $X"
 
-echo "==> subscriber repointed at pgs3 from X"
-s -c "create subscription sub
-      connection 'host=$PSOCK port=$PPORT user=postgres dbname=postgres'
-      publication ps
-      with (enabled = false, create_slot = false, slot_name = 'unused', copy_data = false,
-            binary = true, streaming = off);" >/dev/null
-s -c "select pg_replication_origin_advance('pg_' || oid, '$X') from pg_subscription where subname = 'sub';" >/dev/null
+echo "==> check, serve, subscribe at X"
+"$ROOT/target/debug/pgs3" check --wal "$BASE/wal" --catalog "$BASE/catalog.json" \
+  --restore-command "cp $ARCH/%f %p" 2>&1 | sed 's/^/    /'
 "$ROOT/target/debug/pgs3" serve --wal "$BASE/wal" --catalog "$BASE/catalog.json" \
   --listen "127.0.0.1:$LPORT" --restore-command "cp $ARCH/%f %p" \
   --source "host=$PSOCK port=$PPORT user=postgres dbname=postgres" > "$BASE/pgs3.log" 2>&1 &
 PGS3_PID=$!
 for _ in $(seq 100); do grep -q 'listening on' "$BASE/pgs3.log" && break; sleep 0.1; done
-s -c "alter subscription sub connection 'host=127.0.0.1 port=$LPORT user=postgres dbname=postgres';
-      alter subscription sub enable;" >/dev/null
+"$ROOT/target/debug/pgs3" subscribe --target "host=$SSOCK port=$SPORT user=postgres dbname=postgres" \
+  --source "host=$PSOCK port=$PPORT user=postgres dbname=postgres" --publication ps \
+  --catalog "$BASE/catalog.json" --at "$X" --listen "127.0.0.1:$LPORT" 2>&1 | sed 's/^/    /'
+[ "$(p -c "select count(*) from pg_replication_slots;")" = 0 ] || fail "subscribe left a slot on the primary"
 p -c "insert into s values (4,'after the subscriber connected'); update s set name='updated' where id=1;" >/dev/null
 p >/dev/null <<'EOF'
 insert into t values

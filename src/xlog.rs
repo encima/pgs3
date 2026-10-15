@@ -121,6 +121,26 @@ pub struct SegmentDir {
     restore_command: Option<String>,
     /// Source conninfo to run `pg_switch_wal()` against, and when we last did.
     switch_wal: Option<(String, Option<Instant>)>,
+    /// The segment we last said we were waiting for, so each wait is logged
+    /// once rather than at the polling rate.
+    announced_wait: Option<String>,
+}
+
+/// Whether the implicit wal-g fetcher is configured.
+fn walg_configured() -> bool {
+    std::env::var_os("PGS3_WALG_CONFIG").is_some() || std::env::var_os("WALG_S3_PREFIX").is_some()
+}
+
+/// One line for the startup log saying where segments will come from.
+pub fn describe_fetcher(restore_command: Option<&str>, dir: &str) -> String {
+    match restore_command {
+        Some(cmd) => format!("restore_command `{cmd}` into {dir}"),
+        None if walg_configured() => format!("wal-g wal-fetch into {dir}"),
+        None => format!(
+            "{dir} only -- no --restore-command, PGS3_RESTORE_COMMAND or PGS3_WALG_CONFIG \
+             is set, so segments must be copied there by something else"
+        ),
+    }
 }
 
 /// At most one forced switch this often: each one closes a segment early, and
@@ -201,6 +221,7 @@ impl SegmentDir {
             last_miss: None,
             restore_command: None,
             switch_wal: None,
+            announced_wait: None,
         }
     }
 
@@ -250,8 +271,7 @@ impl SegmentDir {
     fn fetch(&mut self, name: &str, dest: &Path) -> Result<bool> {
         let restore = self.restore_command.clone();
         let config = std::env::var("PGS3_WALG_CONFIG").ok();
-        let have_walg = config.is_some() || std::env::var_os("WALG_S3_PREFIX").is_some();
-        if restore.is_none() && !have_walg {
+        if restore.is_none() && !walg_configured() {
             return Ok(false);
         }
         let due = {
@@ -283,6 +303,15 @@ impl SegmentDir {
             self.last_miss = None;
             return Ok(true);
         }
+        // The shell's "not found" and "not executable": a broken fetcher, not
+        // a segment that is late, and retrying it would wait forever.
+        if restore.is_some() && matches!(status.code(), Some(126 | 127)) {
+            bail!(
+                "restore_command could not run (exit {}); check that the tool it calls is \
+                 installed and in PATH",
+                status.code().unwrap_or_default()
+            );
+        }
         self.switch_wal(name);
         let prev =
             self.last_miss.as_ref().filter(|(n, _, _)| n == name).map(|(_, _, wait)| *wait);
@@ -299,6 +328,10 @@ impl SegmentDir {
                 // Not on disk and the archive fetcher couldn't get it either:
                 // treat exactly like a missing file below, since we only ever
                 // read forward.
+                if self.announced_wait.as_deref() != Some(name.as_str()) {
+                    eprintln!("pgs3: waiting for WAL segment {name} to be archived");
+                    self.announced_wait = Some(name.clone());
+                }
                 return Err(anyhow::Error::new(SegmentUnavailable(name)));
             }
             let read = std::fs::read(&path);

@@ -1,142 +1,127 @@
 #!/usr/bin/env bash
-# One-command setup: build, capture catalog, start serve, print subscriber SQL.
+# One command from a primary to a running pgs3: build, capture the catalog at
+# T0, start serving, and print the one command that subscribes the replica.
 #
-#   ./scripts/quickstart.sh <source-conninfo> [options]
+#   scripts/quickstart.sh <primary-conninfo> --restore-command '<cmd>' [options]
 #
-# Examples:
-#   ./scripts/quickstart.sh 'host=primary dbname=mydb'
-#   ./scripts/quickstart.sh 'host=primary dbname=mydb' --publication mypub
-#   ./scripts/quickstart.sh 'host=primary dbname=mydb' --port 15439
+#   --restore-command <cmd>  how to fetch one segment: %f name, %p destination
+#                            e.g. 'aws s3 cp s3://bucket/wal/%f %p'
+#                                 'wal-g wal-fetch %f %p'
+#                            (or set PGS3_WALG_CONFIG to use wal-g's config)
+#   --publication <name>     default p; created FOR ALL TABLES if missing
+#   --port <n>               listen port, default 5439
+#   --listen <addr:port>     listen address, default 127.0.0.1:<port>
+#   --dir <path>             state directory, default ./pgs3-state
+#   --reinit                 capture a new dictionary even if one exists
+#   stop                     stop a pgs3 started by this script
 #
-# What it does:
-#   1. Builds pgs3 (release)
-#   2. Captures the catalog dictionary at T0
-#   3. Starts serve in the background
-#   4. Prints the SQL to create the subscription on the replica
-#
-# After it runs, create the subscription on the replica using the printed SQL,
-# then repoint it at pgs3:
-#   ALTER SUBSCRIPTION sub CONNECTION 'host=127.0.0.1 port=5439 ...';
-#   ALTER SUBSCRIPTION sub ENABLE;
+# Everything lands in <dir>: config.yaml (rerun pgs3 with --config), the
+# dictionary, the segment cache, the log, the status file and the pid file.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-SOURCE="${1:?source conninfo, e.g. 'host=primary dbname=mydb'}"
-shift
-
-PUBLICATION="p"
-PGS3_DIR="${PGS3_DIR:-/tmp/pgs3}"
-LISTEN="127.0.0.1:5439"
-WAL_DIR="${PGS3_DIR}/walcache"
-CATALOG="${PGS3_DIR}/catalog.json"
-CONFIRMED_FILE="${PGS3_DIR}/confirmed.lsn"
-STATUS_FILE="${PGS3_DIR}/status"
-PORT_REPLICATION=5439
-EXTRA_ARGS=()
-
+DIR="${PGS3_DIR:-$PWD/pgs3-state}"
+SOURCE="" PUBLICATION="p" PORT=5439 LISTEN="" RESTORE="${PGS3_RESTORE_COMMAND:-}" REINIT="" STOP=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --publication)  PUBLICATION="$2"; shift 2 ;;
-    --dir)          PGS3_DIR="$2"; shift 2
-                    WAL_DIR="${PGS3_DIR}/walcache"
-                    CATALOG="${PGS3_DIR}/catalog.json"
-                    CONFIRMED_FILE="${PGS3_DIR}/confirmed.lsn"
-                    STATUS_FILE="${PGS3_DIR}/status" ;;
-    --port)         LISTEN="127.0.0.1:$2"; PORT_REPLICATION="$2"; shift 2 ;;
-    --wal-dir)      WAL_DIR="$2"; shift 2 ;;
-    --restore-cmd)  EXTRA_ARGS+=(--restore-command "$2"); shift 2 ;;
-    --source-for-switch) EXTRA_ARGS+=(--source "$2"); shift 2 ;;
-    -h|--help)      sed -n '2,20p' "$0"; exit 0 ;;
-    *)              echo "unknown option: $1" >&2; exit 1 ;;
+    --restore-command|--restore-cmd) RESTORE="$2"; shift 2 ;;
+    --publication)     PUBLICATION="$2"; shift 2 ;;
+    --port)            PORT="$2"; shift 2 ;;
+    --listen)          LISTEN="$2"; shift 2 ;;
+    --dir)             DIR="$2"; shift 2 ;;
+    --reinit)          REINIT=1; shift ;;
+    stop)              STOP=1; shift ;;
+    -h|--help)         usage ;;
+    -*)                echo "unknown option: $1" >&2; usage 1 ;;
+    *)                 SOURCE="$1"; shift ;;
   esac
 done
+LISTEN="${LISTEN:-127.0.0.1:$PORT}"
+PIDFILE="$DIR/pgs3.pid"
 
-mkdir -p "$PGS3_DIR" "$WAL_DIR"
+running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
 
-echo "==> Building pgs3"
+if [ -n "$STOP" ]; then
+  if running; then kill "$(cat "$PIDFILE")"; echo "stopped pgs3 (PID $(cat "$PIDFILE"))"
+  else echo "pgs3 is not running"; fi
+  rm -f "$PIDFILE"; exit 0
+fi
+
+[ -n "$SOURCE" ] || { echo "error: give the primary's conninfo, e.g. 'host=primary dbname=app'" >&2; usage 1; }
+command -v psql >/dev/null || { echo "error: psql is needed in PATH" >&2; exit 1; }
+running && { echo "error: pgs3 is already running (PID $(cat "$PIDFILE")); '$0 stop' first" >&2; exit 1; }
+if [ -z "$RESTORE" ] && [ -z "${PGS3_WALG_CONFIG:-}${WALG_S3_PREFIX:-}" ]; then
+  echo "error: tell pgs3 how to fetch WAL from the archive:" >&2
+  echo "  --restore-command 'aws s3 cp s3://<bucket>/<prefix>/%f %p'   (or wal-g, pgbackrest, ...)" >&2
+  echo "  or export PGS3_WALG_CONFIG=/path/to/walg.json" >&2
+  exit 1
+fi
+
+mkdir -p "$DIR/wal"
+DIR="$(cd "$DIR" && pwd)"
+CONFIG="$DIR/config.yaml"
+
+echo "==> building pgs3"
 ( cd "$ROOT" && cargo build --release --quiet )
 PGS3="$ROOT/target/release/pgs3"
 
-echo "==> Ensuring publication '$PUBLICATION' exists on source"
-if psql "$SOURCE" -tAc "SELECT 1 FROM pg_publication WHERE pubname = '$PUBLICATION'" | grep -q 1; then
-  echo "    already exists"
+echo "==> publication '$PUBLICATION' on the primary"
+if [ "$(psql -X -tAq -d "$SOURCE" -v p="$PUBLICATION" <<<"select count(*) from pg_publication where pubname = :'p';")" = 1 ]; then
+  echo "    exists"
 else
-  psql "$SOURCE" -c "CREATE PUBLICATION $PUBLICATION FOR ALL TABLES;" 2>&1 | sed 's/^/    /'
-  echo "    created (FOR ALL TABLES)"
+  psql -X -q -d "$SOURCE" -v ON_ERROR_STOP=1 -v p="$PUBLICATION" <<<'create publication :"p" for all tables;'
+  echo "    created FOR ALL TABLES"
 fi
 
-CONFIG_FILE="${PGS3_DIR}/config.yaml"
-cat > "$CONFIG_FILE" <<EOF
-catalog: $CATALOG
-publication: $PUBLICATION
-wal: $WAL_DIR
-listen: $LISTEN
-confirmed-lsn-file: $CONFIRMED_FILE
-status-file: $STATUS_FILE
-EOF
+# Single-quoted YAML: only ' needs escaping, as ''.
+yq() { printf "'%s'" "${1//\'/\'\'}"; }
+{
+  echo "# Written by scripts/quickstart.sh. Use with: pgs3 <command> --config $CONFIG"
+  echo "source: $(yq "$SOURCE")"
+  echo "publication: $(yq "$PUBLICATION")"
+  echo "catalog: $(yq "$DIR/catalog.json")"
+  echo "wal: $(yq "$DIR/wal")"
+  echo "listen: $(yq "$LISTEN")"
+  echo "status-file: $(yq "$DIR/status.json")"
+  [ -n "$RESTORE" ] && echo "restore-command: $(yq "$RESTORE")"
+} > "$CONFIG"
 
-echo "==> Capturing catalog dictionary at T0"
-echo "    source: $SOURCE"
-echo "    config:   $CONFIG_FILE"
-"$PGS3" init --config "$CONFIG_FILE" --source "$SOURCE" 2>&1 | sed 's/^/    /'
+# Re-capturing moves T0, which must not happen under a running subscription.
+if [ -s "$DIR/catalog.json" ] && [ -z "$REINIT" ]; then
+  echo "==> reusing the dictionary in $DIR/catalog.json (--reinit to capture a new T0)"
+else
+  echo "==> capturing the catalog dictionary at T0"
+  "$PGS3" init --config "$CONFIG" 2>&1 | sed 's/^/    /'
+fi
 
-echo "==> Starting pgs3 serve on $LISTEN"
-echo "    wal dir:    $WAL_DIR"
-echo "    catalog:    $CATALOG"
-echo "    confirmed:  $CONFIRMED_FILE"
-echo "    status:     $STATUS_FILE"
-echo "    extra:      ${EXTRA_ARGS[*]:-(none)}"
+echo "==> checking the archive"
+"$PGS3" check --config "$CONFIG" 2>&1 | sed 's/^/    /'
 
-"$PGS3" serve --config "$CONFIG_FILE" "${EXTRA_ARGS[@]}" \
-  > "${PGS3_DIR}/pgs3.log" 2>&1 &
-
-SERVE_PID=$!
-echo "$SERVE_PID" > "${PGS3_DIR}/serve.pid"
-
-# Wait for listener
-for _ in $(seq 100); do
-  grep -q 'listening on' "${PGS3_DIR}/pgs3.log" 2>/dev/null && break
-  kill -0 "$SERVE_PID" 2>/dev/null || { echo "serve died:"; cat "${PGS3_DIR}/pgs3.log"; exit 1; }
+echo "==> starting pgs3 on $LISTEN"
+nohup "$PGS3" serve --config "$CONFIG" >> "$DIR/pgs3.log" 2>&1 &
+echo $! > "$PIDFILE"
+for _ in $(seq 50); do
+  grep -q 'listening on' "$DIR/pgs3.log" && break
+  running || { tail -20 "$DIR/pgs3.log"; echo "error: pgs3 exited" >&2; exit 1; }
   sleep 0.1
 done
+START=$(sed -nE 's/.*"start_lsn" *: *"([^"]+)".*/\1/p' "$DIR/catalog.json")
 
-grep -q 'listening on' "${PGS3_DIR}/pgs3.log" || { echo "serve never listened:"; cat "${PGS3_DIR}/pgs3.log"; exit 1; }
+cat <<EOF
 
-echo "==> Checking WAL directory"
-SEG_COUNT=$(find "$WAL_DIR" -type f -name '*.wal' 2>/dev/null | wc -l | tr -d ' ')
-if [ "$SEG_COUNT" -gt 0 ]; then
-  echo "    found $SEG_COUNT segment(s) already staged in $WAL_DIR"
-  find "$WAL_DIR" -type f -name '*.wal' | sort | sed 's/^/      /'
-else
-  echo "    no segments staged in $WAL_DIR"
-  if [ -n "${EXTRA_ARGS[*]:-}" ] && echo "${EXTRA_ARGS[*]}" | grep -q 'restore-command'; then
-    echo "    serve will fetch on demand via --restore-command"
-  else
-    echo "    WARNING: no --restore-command set and WAL dir is empty."
-    echo "    serve will block until segments appear. Either:"
-    echo "      1. Pre-stage WAL: cp \$PGDATA/pg_wal/*.wal $WAL_DIR/"
-    echo "      2. Re-run with --restore-command '...' to fetch on demand"
-  fi
-fi
+pgs3 is serving (PID $(cat "$PIDFILE")), reading WAL from $START onwards.
 
-echo ""
-echo "==> pgs3 is serving (PID $SERVE_PID). On the replica, run:"
-echo ""
-echo "  -- Establish the subscription against the PRIMARY first (T0):"
-echo "  CREATE SUBSCRIPTION sub"
-echo "    CONNECTION 'host=<primary-host> port=<primary-port> user=<user> dbname=<db>'"
-echo "    PUBLICATION $PUBLICATION"
-echo "    WITH (binary = true, streaming = off, copy_data = false, slot_name = 'sub');"
-echo ""
-echo "  -- After the upgrade, repoint at pgs3:"
-echo "  ALTER SUBSCRIPTION sub CONNECTION 'host=127.0.0.1 port=$PORT_REPLICATION dbname=<db>';"
-echo "  ALTER SUBSCRIPTION sub ENABLE;"
-echo ""
-echo "==> Monitor:"
-echo "  tail -f ${PGS3_DIR}/pgs3.log"
-echo "  cat ${PGS3_DIR}/status"
-echo "  cat ${CONFIRMED_FILE} 2>/dev/null"
-echo ""
-echo "==> Stop:"
-echo "  kill \$(cat ${PGS3_DIR}/serve.pid)"
+Once the replica holds the data as of some LSN X >= $START (restored from a
+snapshot taken after this point, or pg_upgraded from one), subscribe it with:
+
+  $PGS3 subscribe --config $CONFIG \\
+      --target 'host=<replica> dbname=<db>' --at <X>
+
+That creates no slot on the primary. Then watch:
+
+  tail -f $DIR/pgs3.log
+  cat $DIR/status.json
+  $0 stop --dir $DIR
+EOF
