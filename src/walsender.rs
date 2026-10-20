@@ -85,6 +85,16 @@ impl Conn {
         }
     }
 
+    /// `try_message` without waiting out the read timeout. The streaming loop
+    /// polls between WAL records, and 20ms per record caps catch-up at ~50
+    /// records a second.
+    fn poll_message(&mut self) -> Result<Option<(u8, Vec<u8>)>> {
+        self.stream.set_nonblocking(true)?;
+        let r = self.try_message();
+        self.stream.set_nonblocking(false)?;
+        r
+    }
+
     /// Next complete tagged message, if one has arrived.
     fn try_message(&mut self) -> Result<Option<(u8, Vec<u8>)>> {
         self.fill()?;
@@ -445,7 +455,7 @@ fn stream(conn: &mut Conn, sql: &str, cat: &Catalog, opts: &Options) -> Result<b
     loop {
         // Client feedback first: it drives both the confirmed-LSN file and the
         // decision to stop.
-        while let Some((tag, body)) = conn.try_message()? {
+        while let Some((tag, body)) = conn.poll_message()? {
             match tag {
                 b'd' if body.first() == Some(&b'r') && body.len() >= 34 => {
                     // StandbyStatusUpdate: write, flush, apply, clock, replyRequested

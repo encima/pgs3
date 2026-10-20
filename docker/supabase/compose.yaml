@@ -1,0 +1,146 @@
+# pgs3 between two supabase/postgres databases, with wal-g as the archive:
+#
+#   primary --wal-g wal-push--> S3 --wal-g wal-fetch--> pgs3 --pgoutput--> replica
+#
+# The replica starts as an ordinary logical subscriber of the primary. It then
+# goes offline while the primary writes far more WAL than its slot may retain
+# (max_slot_wal_keep_size), so Postgres invalidates the slot and recycles the
+# WAL. The replica is brought back through pgs3, from the wal-g archive alone.
+#
+#   docker compose -f docker/supabase/compose.yaml up --build \
+#     --abort-on-container-exit --exit-code-from demo
+#
+# SCALE (default 1) multiplies the workload: SCALE=3 writes roughly 3x the WAL.
+#
+# S3 is SeaweedFS rather than MinIO: MinIO no longer publishes images. wal-g
+# only needs an S3 endpoint, so swap in any other one by editing walg.json.
+
+name: pgs3-supabase
+
+x-supabase: &supabase
+  image: ${SUPABASE_POSTGRES:-supabase/postgres:17.6.1.035}
+  environment:
+    POSTGRES_PASSWORD: postgres
+  healthcheck:
+    # -h localhost: the entrypoint's temporary init-time server only listens on
+    # the socket, so this passes once the real server is up.
+    test: ["CMD-SHELL", "pg_isready -U supabase_admin -d postgres -h localhost"]
+    interval: 2s
+    timeout: 3s
+    retries: 90
+
+services:
+  # wal-g does not create buckets, so this does, then reports healthy. (A
+  # one-shot service would end the run under --abort-on-container-exit.)
+  s3:
+    image: chrislusf/seaweedfs:latest
+    entrypoint:
+      - sh
+      - -c
+      - |
+        weed server -s3 -dir=/data -ip=s3 -ip.bind=0.0.0.0 &
+        until echo 's3.bucket.list' | weed shell -master=localhost:9333 2>/dev/null | grep -q pgs3; do
+          echo 's3.bucket.create -name pgs3' | weed shell -master=localhost:9333 >/dev/null 2>&1
+          sleep 1
+        done
+        touch /tmp/bucket-ready
+        echo 's3: bucket s3://pgs3 ready'
+        wait
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/bucket-ready"]
+      interval: 1s
+      retries: 120
+    networks: [upstream, downstream]
+
+  primary:
+    <<: *supabase
+    depends_on:
+      s3: {condition: service_healthy}
+    command:
+      - postgres
+      - -D
+      - /etc/postgresql
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=wal-g --config /etc/wal-g/config.json wal-push %p
+      # Roll a segment even when idle, so the archive keeps up with the demo.
+      - -c
+      - archive_timeout=10s
+      # The point of the demo: Supabase ships 4GB here. Make it small enough
+      # that the workload below blows straight through it.
+      - -c
+      - max_slot_wal_keep_size=128MB
+      - -c
+      - wal_keep_size=0
+      # Checkpoint (and so recycle WAL) often.
+      - -c
+      - max_wal_size=256MB
+      - -c
+      - min_wal_size=64MB
+    volumes:
+      - ./walg.json:/etc/wal-g/config.json:ro
+    networks: [upstream]
+    ports:
+      - "55432:5432"
+
+  replica:
+    <<: *supabase
+    command:
+      - postgres
+      - -D
+      - /etc/postgresql
+      # pg_cron, pg_net and friends already take some of the default 8.
+      - -c
+      - max_worker_processes=16
+    # On both networks: it subscribes to the primary first, then to pgs3.
+    networks: [upstream, downstream]
+    ports:
+      - "55433:5432"
+
+  pgs3:
+    build:
+      context: ../..
+      dockerfile: docker/supabase/Dockerfile
+    image: pgs3-supabase
+    volumes:
+      - ./walg.json:/etc/wal-g/config.json:ro
+      - state:/state
+    # Only `downstream`: no route to the primary. What it serves can only have
+    # come out of the bucket.
+    networks: [downstream]
+    ports:
+      - "55439:5439"
+    restart: on-failure
+    healthcheck: {disable: true}
+    # wal-g wal-fetch forks prefetch workers; something has to reap them.
+    init: true
+
+  # Same image as pgs3: it has psql, wal-g and the pgs3 binary for `pgs3 init`.
+  demo:
+    build:
+      context: ../..
+      dockerfile: docker/supabase/Dockerfile
+    image: pgs3-supabase
+    depends_on:
+      pgs3: {condition: service_started}
+      primary: {condition: service_healthy}
+      replica: {condition: service_healthy}
+    environment:
+      PGUSER: supabase_admin
+      PGPASSWORD: postgres
+      SCALE: ${SCALE:-1}
+    volumes:
+      - ./walg.json:/etc/wal-g/config.json:ro
+      - ./demo.sh:/demo.sh:ro
+      - state:/state
+    entrypoint: ["/bin/bash", "/demo.sh"]
+    healthcheck: {disable: true}
+    networks: [upstream, downstream]
+
+networks:
+  upstream:
+  downstream:
+
+volumes:
+  state:

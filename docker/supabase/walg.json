@@ -1,0 +1,8 @@
+{
+  "WALG_S3_PREFIX": "s3://pgs3/wal",
+  "AWS_ENDPOINT": "http://s3:8333",
+  "AWS_ACCESS_KEY_ID": "pgs3",
+  "AWS_SECRET_ACCESS_KEY": "pgs3",
+  "AWS_REGION": "us-east-1",
+  "AWS_S3_FORCE_PATH_STYLE": "true"
+}

@@ -90,6 +90,24 @@ ALTER SUBSCRIPTION sub ENABLE;
 The subscription must be `binary = true, streaming = off`. `docker/compose.yaml`
 and `scripts/minio-demo.sh` walk through this shape end to end.
 
+### Demo: a subscriber that outlived its slot (Supabase + wal-g)
+
+`docker/supabase/` runs two `supabase/postgres` databases with wal-g archiving
+to S3 (SeaweedFS). The replica subscribes the ordinary way, goes offline, and
+the primary writes ~600MB of WAL against `max_slot_wal_keep_size = 128MB`:
+1M-row bulk inserts, TOASTed documents, wide updates, deletes. Postgres
+invalidates the slot (`wal_status = lost`) and recycles the WAL. The replica is
+then repointed at pgs3, which has no network route to the primary, and catches
+up from the wal-g archive alone. Both databases are compared row by row, and
+the dead slot is dropped.
+
+```
+docker compose -f docker/supabase/compose.yaml up --build \
+  --abort-on-container-exit --exit-code-from demo
+SCALE=3 docker compose -f docker/supabase/compose.yaml up ...   # ~3x the WAL
+docker compose -f docker/supabase/compose.yaml down -v
+```
+
 ## The approach
 
 Capture the catalog **once**, at T0, into a frozen dictionary
