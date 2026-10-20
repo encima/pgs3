@@ -286,6 +286,39 @@ pub fn parse_xact(r: &Record) -> Result<XactInfo> {
     Ok(info)
 }
 
+/// `XLOG_LOGICAL_MESSAGE`, the only opcode of the logical message rmgr.
+pub const XLOG_LOGICAL_MESSAGE: u8 = 0x00;
+
+/// A `pg_logical_emit_message()` record.
+pub struct LogicalMessage<'r> {
+    pub db_oid: u32,
+    pub transactional: bool,
+    pub prefix: &'r str,
+    pub payload: &'r [u8],
+}
+
+/// `xl_logical_message`: dbId, transactional, then two `Size`s at their
+/// natural 8-byte alignment, then the NUL-terminated prefix and the payload.
+pub fn parse_logical_message(r: &Record) -> Result<LogicalMessage<'_>> {
+    const HEADER: usize = 24; // offsetof(xl_logical_message, message)
+    let d = &r.main_data;
+    ensure!(d.len() >= HEADER, "logical message at {} is truncated", r.lsn);
+    let db_oid = u32::from_le_bytes(d[0..4].try_into()?);
+    let transactional = d[4] != 0;
+    let prefix_size = u64::from_le_bytes(d[8..16].try_into()?) as usize;
+    let message_size = u64::from_le_bytes(d[16..24].try_into()?) as usize;
+    ensure!(
+        prefix_size >= 1 && d.len() - HEADER >= prefix_size && d.len() - HEADER - prefix_size >= message_size,
+        "logical message at {} declares {prefix_size}+{message_size} bytes but carries {}",
+        r.lsn,
+        d.len() - HEADER
+    );
+    let prefix = std::str::from_utf8(&d[HEADER..HEADER + prefix_size - 1])
+        .map_err(|_| anyhow::anyhow!("logical message at {} has a non-UTF-8 prefix", r.lsn))?;
+    let start = HEADER + prefix_size;
+    Ok(LogicalMessage { db_oid, transactional, prefix, payload: &d[start..start + message_size] })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,8 +328,25 @@ mod tests {
     fn rec(rmid: u8, info: u8, main_data: Vec<u8>) -> Record {
         Record {
             lsn: Lsn(0), end_lsn: Lsn(0), tot_len: 0, xid: 1, rmid, info,
-            main_data, blocks: Vec::new(),
+            main_data, blocks: Vec::new(), top_xid: None,
         }
+    }
+
+    #[test]
+    fn logical_message_prefix_and_payload() {
+        let mut md = Vec::new();
+        md.extend_from_slice(&5u32.to_le_bytes()); // dbId
+        md.extend_from_slice(&[1, 0xAA, 0xAA, 0xAA]); // transactional + padding
+        md.extend_from_slice(&5u64.to_le_bytes()); // "pgs3\0"
+        md.extend_from_slice(&2u64.to_le_bytes());
+        md.extend_from_slice(b"pgs3\0{}");
+        let r = rec(crate::xlog::RM_LOGICALMSG_ID, XLOG_LOGICAL_MESSAGE, md.clone());
+        let m = parse_logical_message(&r).unwrap();
+        assert_eq!((m.db_oid, m.transactional, m.prefix, m.payload), (5, true, "pgs3", &b"{}"[..]));
+        // A declared size beyond the record is an error, not a panic.
+        md[16..24].copy_from_slice(&99u64.to_le_bytes());
+        let r = rec(crate::xlog::RM_LOGICALMSG_ID, XLOG_LOGICAL_MESSAGE, md);
+        assert!(parse_logical_message(&r).is_err());
     }
 
     #[test]

@@ -105,6 +105,10 @@ pub struct Catalog {
     /// when the dictionary was dumped by hand.
     pub start_lsn: Option<String>,
     pub timeline_id: Option<u32>,
+    /// The publication this describes. Absent in dictionaries captured before
+    /// it was recorded.
+    #[serde(default)]
+    pub publication: Option<String>,
     pub relations: Vec<Relation>,
     pub rowtype_catalogs: RowtypeCatalogs,
     #[serde(default)]
@@ -124,7 +128,13 @@ impl Catalog {
     pub fn load(path: impl AsRef<Path>) -> Result<Catalog> {
         let text = std::fs::read_to_string(path.as_ref())
             .with_context(|| format!("reading catalog dictionary {:?}", path.as_ref()))?;
-        let mut cat: Catalog = serde_json::from_str(&text).context("parsing catalog dictionary")?;
+        Catalog::from_json(&text)
+    }
+
+    /// Parse and index a dictionary: from a file, or from one the source
+    /// emitted into WAL alongside a schema change.
+    pub fn from_json(text: &str) -> Result<Catalog> {
+        let mut cat: Catalog = serde_json::from_str(text).context("parsing catalog dictionary")?;
         // The dictionary is trusted input, but a malformed one would otherwise
         // surface much later as corrupt pgoutput frames or a decoding loop
         // that never advances.

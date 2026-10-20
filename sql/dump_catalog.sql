@@ -12,6 +12,7 @@ select json_build_object(
   'system_identifier', (select system_identifier::text from pg_control_system()),
   'captured_at_lsn', pg_current_wal_lsn()::text,
   'timeline_id', (select timeline_id from pg_control_checkpoint()),
+  'publication', :'pubname',
   -- restart_lsn of the temporary slot `pgs3 init` creates in this session: the
   -- point from which every later commit decodes completely. Null otherwise.
   'start_lsn', (select restart_lsn::text from pg_replication_slots

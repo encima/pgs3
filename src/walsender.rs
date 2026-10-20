@@ -439,7 +439,7 @@ fn stream(conn: &mut Conn, sql: &str, cat: &Catalog, opts: &Options) -> Result<b
     }
     let mut rb = ReorderBuffer::new(cat);
     rb.strict_ddl = opts.strict_ddl;
-    let mut enc = Encoder::new(cat);
+    let mut enc = Encoder::new();
 
     // Only commit boundaries count as progress: the subscriber's flush LSN
     // advances to a transaction's end_lsn once it has applied it, never to a

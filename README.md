@@ -50,7 +50,8 @@ accepts with `--config`. `scripts/quickstart.sh stop` stops it.
 ```
 # 1. T0, on the primary: capture the dictionary and the start LSN. A temporary
 #    slot is used and dropped -- nothing is left behind to retain WAL.
-#    From here on: no DDL or TRUNCATE on published tables.
+#    It also installs an event trigger that records schema changes (below).
+#    From here on: no TRUNCATE on published tables.
 pgs3 init --source 'host=primary dbname=app' --catalog catalog.json --publication p
 
 # 2. Serve the archive. The --wal directory is a cache, created if missing,
@@ -101,14 +102,10 @@ then repointed at pgs3, which has no network route to the primary, and catches
 up from the wal-g archive alone. Both databases are compared row by row, and
 the dead slot is dropped.
 
-It then walks a schema change. DDL on an unpublished table passes straight
-through. `ADD COLUMN` and a rewriting `ALTER COLUMN ... TYPE bigint` on
-published tables stop pgs3 at the exact LSN of the change, with everything
-before it applied and nothing misread. The dictionary is then re-captured
-(a new T0), the subscriber's origin is moved to it, and pgs3 restarts on the
-new dictionary to deliver the writes made in the new shape. The one
-requirement is no writes to published tables between the DDL and the
-re-capture.
+It then makes schema changes with a writer still running: DDL on an
+unpublished table, `ADD COLUMN` plus a backfill in the same transaction, and a
+rewriting `ALTER COLUMN ... TYPE bigint`. pgs3 picks up each new dictionary
+from WAL and keeps streaming: no pause, no restart, no re-capture.
 
 ```
 docker compose -f docker/supabase/compose.yaml up --build \
@@ -123,7 +120,6 @@ Capture the catalog **once**, at T0, into a frozen dictionary
 (`sql/dump_catalog.sql`). Decode against that snapshot instead of against the
 primary's live catalog.
 
-You could also do this at regular points in time, like when the catalog changes, for example, so we can associate different WAL files with different catalogs. 
 
 The consequence is the whole point: because we never consult the primary's
 catalog, the primary never has to preserve it. It holds no `catalog_xmin` on our
@@ -135,11 +131,44 @@ primary --archive--> S3 --wal-fetch--> pgs3 --pgoutput--> upgraded replica
    +-- pg_replication_slot_advance() <---+   (advance to the subscriber's flush)
 ```
 
-The cost of freezing is that DDL after T0 invalidates the dictionary. That is
-already forbidden during a logical-replication upgrade, so `pgs3` enforces it —
-but precisely. It watches writes to `pg_class` and `pg_attribute`, both of which
-lead with the Oid of the relation they describe, and stops only when that Oid is
-a *published* relation. DDL on other tables is fine.
+### Schema changes
+
+A frozen dictionary goes stale at the first DDL on a published table, so the
+source writes a new one into WAL. `pgs3 init` installs a `ddl_command_end`
+event trigger (`sql/ddl_trigger.sql`) that, whenever a command touches a
+published table, a type or the publication, runs the same query as
+`sql/dump_catalog.sql` and emits the result with
+`pg_logical_emit_message(true, 'pgs3.dictionary', ...)`. Being transactional,
+the message sits in the DDL's own transaction, after that command's catalog
+writes, and is discarded with it on rollback (savepoints included).
+
+pgs3 switches at exactly that point. Changes later in the same transaction
+decode with the new dictionary, every other transaction switches at its
+commit (the `ACCESS EXCLUSIVE` lock behind rowtype-changing DDL means no other
+transaction can hold rows in the old shape past it), and the subscriber is
+sent a fresh Relation message before the first row in the new shape, as
+Postgres does. The archive describes its own schema; nothing has to be
+re-captured.
+
+The guard stays as the safety net. pgs3 watches writes to `pg_class` and
+`pg_attribute`, both of which lead with the Oid of the relation they
+describe, and if one concerns a *published* relation without a dictionary
+following it in the same transaction, it refuses at that commit: the
+trigger was missing, disabled (`session_replication_role = replica`, PG17's
+`event_triggers = off`), or failed (it warns and never blocks the user's
+DDL). DDL on other tables is ignored. Two transactions changing schema
+concurrently, where the later commit's dictionary predates the earlier
+commit, are refused too, since that dictionary may not include both changes.
+
+As with any logical replication, the subscriber needs the DDL too, in the
+right order: added columns there first, dropped columns there last.
+`binary = true` means a column type change must reach both sides with no
+rows of that table in flight.
+
+The trigger finds the publications to describe by a comment: `pgs3 init`
+sets `COMMENT ON PUBLICATION p IS 'pgs3'` (and refuses to overwrite another
+comment). `--no-ddl-trigger` skips all of it, leaving DDL on a published table
+as a hard stop.
 
 ## Input and Output
 
@@ -153,7 +182,8 @@ Input half — done and verified:
 | Values | `numeric` and `jsonb` unpacking, arrays incl. multi-dimensional, empty and null-containing |
 | TOAST | chunk collection and reassembly, including unchanged-value detection |
 | Reorder | per-xid buffering, subtransactions merged at commit, commit ordering, rolled-back xacts and savepoints dropped |
-| Guard | refuses on DDL against a published relation after T0, on an archive from another cluster, and on WAL written below `wal_level=logical` |
+| Schema changes | follows dictionaries the source writes into WAL with each DDL on a published table, mid-transaction and through savepoints; re-announces changed relations |
+| Guard | refuses on DDL against a published relation not followed by a new dictionary, on an archive from another cluster, and on WAL written below `wal_level=logical` |
 
 Output half — done and verified:
 
@@ -174,7 +204,11 @@ Not implemented:
 - streaming of in-progress transactions
 - two-phase commit
 - range/multirange/geometric types
-- scheduled/regular catalog caching
+- dictionaries on a schedule (a periodic `pg_logical_emit_message` of the same
+  dictionary would let serve start from any LSN without `init`)
+- schema changes on PG13 and older are only followed when the DDL and its
+  dictionary are in the same (sub)transaction: subtransactions name their
+  parent in WAL from PG14
 
 
 ## Deliberate limitations

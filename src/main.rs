@@ -30,8 +30,9 @@ The usual run is three commands:
 
 commands:
   init       capture the catalog dictionary (and the start LSN) from the primary
-             at T0. With --target, also copies the schema there. Needs psql
-             (and pg_dump for --target). No DDL on published tables after this.
+             at T0, and install an event trigger there that records a new one
+             with every schema change to a published table. With --target, also
+             copies the schema there. Needs psql (and pg_dump for --target).
   check      validate a dictionary and the archive without serving: types are
              encodable, the start segment can be fetched and belongs to this
              cluster.
@@ -66,6 +67,9 @@ options (any of these may also be a key in --config; the command line wins):
   --status-file <path>         serve: JSON {state, lsn, confirmed} for monitoring
   --exit-when-caught-up        serve: stop once the subscriber confirmed everything
   --allow-catalog-changes      do not stop on DDL against a published table
+  --no-ddl-trigger             init: do not install the event trigger that writes
+                               a new dictionary into WAL with each schema change
+                               (without it, DDL on a published table stops serve)
 
   --target <conninfo>          init: copy the schema here. subscribe: the replica.
   --at <lsn>                   subscribe: the LSN the replica's data is consistent
@@ -100,6 +104,7 @@ const OPTIONS: &[(&str, bool)] = &[
     ("status-file", true),
     ("exit-when-caught-up", false),
     ("allow-catalog-changes", false),
+    ("no-ddl-trigger", false),
     ("at", true),
     ("connect", true),
     ("subscription", true),
@@ -357,7 +362,7 @@ fn run() -> Result<()> {
             pgoutput::check_publication_encodable(cat)?;
             let mut rb = reorder::ReorderBuffer::new(cat);
             rb.strict_ddl = strict_ddl;
-            let mut enc = pgoutput::Encoder::new(cat);
+            let mut enc = pgoutput::Encoder::new();
             while let Some(r) = reader.next_record()? {
                 for e in rb.feed(&r)? {
                     for msg in enc.encode(&e)? {
@@ -427,8 +432,26 @@ fn init(o: &Opts) -> Result<()> {
          CREATE PUBLICATION {publication} FOR ALL TABLES;"
     );
 
-    // Dictionary first: its captured_at_lsn is T0, and from here on the
-    // source's schema must not change.
+    // The trigger before the dictionary, so no schema change can fall between
+    // the two. Not fatal: without it pgs3 still works, but stops at DDL.
+    let mut tracks_ddl = false;
+    if !o.flag("no-ddl-trigger") {
+        match psql(&source, &[("pubname", &publication)], &ddl_trigger_sql(), "installing the DDL trigger") {
+            Ok(_) => {
+                tracks_ddl = true;
+                eprintln!(
+                    "pgs3: event trigger pgs3_dictionary installed; schema changes to published \
+                     tables are recorded in WAL"
+                )
+            }
+            Err(e) => eprintln!(
+                "pgs3: warning: could not install the DDL event trigger ({e:#}). Schema changes \
+                 to published tables will stop serve until the dictionary is re-captured."
+            ),
+        }
+    }
+
+    // Dictionary next: its captured_at_lsn is T0.
     // A temporary slot waits until every transaction running now has ended, so
     // its restart_lsn is where decoding sees each later commit whole. The
     // dictionary query reads it by name and the slot goes when psql exits:
@@ -475,10 +498,28 @@ fn init(o: &Opts) -> Result<()> {
     }
 
     eprintln!(
-        "pgs3: from now on, no DDL or TRUNCATE on published tables. Next:\n  \
-         pgs3 serve --catalog {catalog_path} --wal <cache-dir> --restore-command '<fetch %f to %p>'"
+        "pgs3: from now on, no {} on published tables. Next:\n  \
+         pgs3 serve --catalog {catalog_path} --wal <cache-dir> --restore-command '<fetch %f to %p>'",
+        if tracks_ddl { "TRUNCATE" } else { "DDL or TRUNCATE" }
     );
     Ok(())
+}
+
+/// `pgs3.dictionary(pubname)`, the same query as `sql/dump_catalog.sql`, plus
+/// the event trigger that writes its result into WAL with each schema change.
+fn ddl_trigger_sql() -> String {
+    let query = include_str!("../sql/dump_catalog.sql")
+        // A SQL function's parameter, qualified: `pubname` alone is also a
+        // column of pg_publication_tables, and the column would win.
+        .replace(":'pubname'", "dictionary.pubname");
+    let query = query.trim_end().trim_end_matches(';');
+    format!(
+        "create schema if not exists pgs3;\n\
+         create or replace function pgs3.dictionary(pubname text) returns json\n\
+         language sql stable set search_path = pg_catalog, pg_temp as $dict$\n{query}\n$dict$;\n\
+         {}",
+        include_str!("../sql/ddl_trigger.sql")
+    )
 }
 
 /// Turn a listen address into a conninfo for reaching it from the same host.
