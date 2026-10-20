@@ -101,6 +101,15 @@ then repointed at pgs3, which has no network route to the primary, and catches
 up from the wal-g archive alone. Both databases are compared row by row, and
 the dead slot is dropped.
 
+It then walks a schema change. DDL on an unpublished table passes straight
+through. `ADD COLUMN` and a rewriting `ALTER COLUMN ... TYPE bigint` on
+published tables stop pgs3 at the exact LSN of the change, with everything
+before it applied and nothing misread. The dictionary is then re-captured
+(a new T0), the subscriber's origin is moved to it, and pgs3 restarts on the
+new dictionary to deliver the writes made in the new shape. The one
+requirement is no writes to published tables between the DDL and the
+re-capture.
+
 ```
 docker compose -f docker/supabase/compose.yaml up --build \
   --abort-on-container-exit --exit-code-from demo
