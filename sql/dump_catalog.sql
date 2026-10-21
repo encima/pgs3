@@ -12,6 +12,7 @@ select json_build_object(
   'system_identifier', (select system_identifier::text from pg_control_system()),
   'captured_at_lsn', pg_current_wal_lsn()::text,
   'timeline_id', (select timeline_id from pg_control_checkpoint()),
+  'publication', :'pubname',
   -- restart_lsn of the temporary slot `pgs3 init` creates in this session: the
   -- point from which every later commit decodes completely. Null otherwise.
   'start_lsn', (select restart_lsn::text from pg_replication_slots
@@ -92,12 +93,18 @@ from (
                'attisdropped', a.attisdropped,
                'attispkey',  coalesce(k.iskey, false),
                'attgenerated', a.attgenerated,
-               'typname',    t.typname,
-               'typnsp',     tn.nspname
+               -- A dropped column's type is gone (atttypid 0), but its
+               -- attlen/attalign still lay out the tuples written before.
+               'typname',    coalesce(t.typname, '-'),
+               'typnsp',     coalesce(tn.nspname, '-'),
+               -- For applying schema changes on the replica.
+               'typdef',     format_type(a.atttypid, a.atttypmod),
+               'default',    pg_get_expr(ad.adbin, ad.adrelid)
              ) order by a.attnum), '[]'::json)
       from pg_attribute a
-      join pg_type t  on t.oid = a.atttypid
-      join pg_namespace tn on tn.oid = t.typnamespace
+      left join pg_type t  on t.oid = a.atttypid
+      left join pg_namespace tn on tn.oid = t.typnamespace
+      left join pg_attrdef ad on ad.adrelid = a.attrelid and ad.adnum = a.attnum
       left join lateral (
         select true as iskey
         from pg_index i

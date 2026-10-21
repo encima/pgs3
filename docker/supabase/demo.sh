@@ -11,9 +11,10 @@
 #   6. the replica is repointed at pgs3, which decodes the wal-g archive
 #   7. the two databases are compared
 #   8. new writes keep flowing; the dead slot is dropped
-#   9. schema changes: DDL on an unpublished table is ignored; DDL on a
-#      published one stops pgs3 exactly there, and it is handed over to a
-#      dictionary re-captured after the change
+#   9. schema changes on the primary while writes keep running: pgs3 init
+#      installed an event trigger that writes a new dictionary into WAL with
+#      each change to a published table; pgs3 switches to it at exactly that
+#      point and applies the change to the replica (its `target`) itself
 set -euo pipefail
 
 SCALE=${SCALE:-1}
@@ -67,7 +68,7 @@ create table documents (
   version    int not null default 1,
   body       text not null);"
 
-rm -f /state/ready /state/restart /state/confirmed.lsn /state/status.json /state/catalog*.json
+rm -f /state/ready /state/confirmed.lsn /state/status.json /state/catalog*.json
 
 say "1. schema on both, publication on the primary"
 pri -c "$SCHEMA create publication p for table accounts, events, documents;" >/dev/null
@@ -79,6 +80,7 @@ say "2. T0: pgs3 captures the catalog dictionary"
 pgs3 init --source "$PRI" --catalog /state/catalog.json --publication p 2>&1 | sed 's/^/        /'
 T0=$(sed -nE 's/.*"start_lsn" *: *"([^"]+)".*/\1/p' /state/catalog.json)
 ok "start LSN $T0; no slot left behind on the primary"
+ok "event trigger $(pri -c "select evtname from pg_event_trigger where evtname = 'pgs3_dictionary';") installed: schema changes are recorded in WAL"
 
 say "3. the replica subscribes to the primary, the ordinary way"
 rep -c "create subscription sub
@@ -228,70 +230,63 @@ retry 120 '[ "$(rep -c "select count(*) from events where id = -1;")" = 1 ]' \
   || die "pgs3 stopped on DDL that does not touch a published table"
 ok "CREATE/ALTER TABLE audit_log: pgs3 kept streaming; the guard only watches published relations"
 
-say "12. schema change on published tables"
-# Everything before the change has been applied: nothing is in flight.
-pri -c "update accounts set balance = balance + 1 where id <= 100;" >/dev/null
-pri -c "select pg_switch_wal();" >/dev/null
-EXPECT=$(digest pri accounts)
-retry 120 '[ "$(digest rep accounts)" = "$EXPECT" ]' || die "pre-DDL writes never arrived"
-ok "pre-change writes applied on the replica"
-# Over the original columns only: the replica gains one below.
-OLD_COLS="select sum(hashtextextended((id, owner, balance, active, tags, updated_at)::text, 0)) from accounts;"
-BEFORE=$(rep -c "$OLD_COLS")
-# Subscriber first, as with any logical replication: it must accept the new
-# shape before rows in it arrive. One additive change (no rewrite), and one
-# that rewrites the table into a new relfilenode.
-DDL="alter table accounts add column region text not null default 'eu';
-     alter table documents alter column version type bigint;"
-rep -c "$DDL" >/dev/null
-pri -c "begin; $DDL commit;" >/dev/null
-DDL_END=$(pri -c "select pg_current_wal_lsn();")
-pri -c "select pg_switch_wal();" >/dev/null
-info "on both: $(echo "$DDL" | tr -s ' \n' ' ')"
-retry 180 'grep -q "DDL at" /state/pgs3.log' || die "pgs3 did not notice the DDL"
-info "pgs3: $(grep -m1 -o 'DDL at .* for the published relation [^ ]*' /state/pgs3.log)"
-ok "pgs3 refused to decode past the change with a dictionary that no longer matches"
-rep -c "alter subscription sub disable;" >/dev/null
-[ "$(rep -c "$OLD_COLS")" = "$BEFORE" ] || die "the replica was changed past the DDL"
-ok "the replica holds exactly what was committed before it; nothing was misread"
-
-say "13. re-capture the dictionary after the change (a new T0)"
-# The one requirement: no writes to published tables between the DDL and this
-# capture, or they would fall in the gap. pgs3 checks the other half itself: it
-# refuses a subscriber that asks for anything before the new start.
-mv /state/catalog.json /state/catalog-t0.json
-pgs3 init --source "$PRI" --catalog /state/catalog.json --publication p 2>&1 | sed -n '1s/^/        /p'
-T1=$(sed -nE 's/.*"start_lsn" *: *"([^"]+)".*/\1/p' /state/catalog.json)
-[ "$(pri -c "select '$T1'::pg_lsn >= '$DDL_END'::pg_lsn;")" = t ] || die "new T0 $T1 is before the DDL"
-ok "new T0 = $T1, after the DDL ended at $DDL_END"
-# Writes resume at once, in the new shape, while pgs3 is still down: they land
-# in the archive like everything else.
-pri >/dev/null <<SQL
+say "12. schema changes on the primary only, with writes still running"
+# A writer that does not stop for the DDL: new events, and balance updates on
+# the very table being altered.
+rm -f /tmp/stop-writer
+( i=0
+  while [ ! -f /tmp/stop-writer ]; do
+    i=$(( i + 1 ))
+    pri -c "insert into events values ($(( 200000000 + i )), $(( 1 + i % 100 )), 'during-ddl', '{}', null, now());
+            update accounts set balance = balance + 1 where id = $(( 1 + i % 100 ));" >/dev/null
+  done
+  echo "$i" > /tmp/writer.count ) &
+WRITER=$!
+sleep 3
+# Nothing is run on the replica: pgs3 has it as `target` in its config, and
+# applies each change there itself, between the right two transactions.
+# One transaction that changes the shape and immediately writes in it: the rows
+# after the ALTER must decode with the new dictionary, the ones before with the
+# old.
+pri >/dev/null <<'SQL'
+begin;
+update accounts set balance = balance + 0.01 where id = 1;
+alter table accounts add column region text not null default 'eu';
 update accounts set region = (array['eu','us','ap'])[1 + id % 3] where id % 2 = 0;
-update documents set version = version + 5000000000 where id % 3 = 0;
-insert into events select g, 1 + g % 100, 'after-ddl', jsonb_build_object('n', g), null, now()
-  from generate_series(100000001, 100000000 + 50000 * $SCALE) g;
+commit;
 SQL
+ok "ADD COLUMN accounts.region and a backfill in the same transaction"
+# A rewrite into a new relfilenode; binary=true sends int4 and int8 differently,
+# so the replica must change between the last old row and the first new one.
+pri -c "alter table documents alter column version type bigint;" >/dev/null
+pri -c "update documents set version = version + 5000000000 where id % 3 = 0;" >/dev/null
+ok "ALTER COLUMN documents.version TYPE bigint (a table rewrite), then versions > 2^32"
+pri -c "alter table events rename column kind to event_kind;" >/dev/null
+pri -c "alter table accounts drop column tags;" >/dev/null
+ok "RENAME COLUMN events.kind, DROP COLUMN accounts.tags, under the writer"
+sleep 3
+touch /tmp/stop-writer; wait "$WRITER"
+ok "$(cat /tmp/writer.count) writer transactions ran straight through all of it"
 pri -c "select pg_switch_wal();" >/dev/null
-ok "writes resumed in the new shape (bigint versions > 2^32, regions) while pgs3 was down"
 
-say "14. hand the subscriber over to the new dictionary"
-# The replica is consistent at the new T0 (nothing published was written
-# between the DDL and it), so its origin moves there -- what
-# `pgs3 subscribe --at` does for a new subscription.
-rep -c "select pg_replication_origin_advance('pg_' || oid, '$T1') from pg_subscription where subname = 'sub';" >/dev/null
-touch /state/restart
-retry 30 '[ ! -f /state/restart ]' || die "pgs3 did not restart"
-retry 60 '(exec 3<>/dev/tcp/pgs3/5439)' || die "pgs3 never came back"
-rep -c "alter subscription sub enable;" >/dev/null
 EXPECT_EVENTS=$(pri -c "select count(*) from events;")
 retry 300 '[ "$(rep -c "select count(*) from events;")" = "$EXPECT_EVENTS" ]' \
-  || die "stalled at $(rep -c 'select count(*) from events;') of $EXPECT_EVENTS events"
-EXPECT=$(digest pri accounts)
-retry 60 '[ "$(digest rep accounts)" = "$EXPECT" ]' || die "accounts never converged"
-ok "pgs3 restarted on the new dictionary and the replica caught up"
+  || die "stalled at $(rep -c 'select count(*) from events;') of $EXPECT_EVENTS events; see /state/pgs3.log"
+for t in accounts documents; do
+  EXPECT=$(digest pri $t)
+  retry 60 '[ "$(digest rep '$t')" = "$EXPECT" ]' || die "$t never converged"
+done
+grep -E 'new dictionary|applied to the target' /state/pgs3.log | sed -E 's/^pgs3: /        /' | cut -c1-150
+! grep -q 'DDL at' /state/pgs3.log || die "pgs3 refused a schema change"
+SHAPE="select table_name || '.' || column_name || ' ' || data_type from information_schema.columns
+       where table_schema = 'public' and table_name in ('accounts', 'events', 'documents') order by 1;"
+[ "$(pri -c "$SHAPE")" = "$(rep -c "$SHAPE")" ] || die "the replica's tables are not the primary's shape"
+ok "the replica has the primary's shape, every change applied by pgs3 at its place in the stream"
+info "recorded on the replica: $(rep -c "select count(*) from pgs3.schema_changes;") schema change phase(s) in pgs3.schema_changes"
+
+say "13. compare again"
 compare
 ok "$(rep -c "select count(*) from documents where version > 4294967295;") documents with bigint versions, regions: $(rep -c "select string_agg(region || '=' || n, ' ') from (select region, count(*) n from accounts group by 1 order by 1) x;")"
 
 printf '\n\033[1;32mAll steps passed.\033[0m The replica outlived its slot by %s of WAL,\n' "$(pretty "$WAL_BYTES")"
-printf 'was brought back from the wal-g archive alone, and followed a schema change.\n\n'
+printf 'was brought back from the wal-g archive alone, and followed schema changes it applied itself.\n\n'
