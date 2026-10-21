@@ -14,12 +14,8 @@ while [ ! -f "$STATE/ready" ]; do sleep 0.5; done
 : > "$LOG"
 tail -F "$LOG" 2>/dev/null &
 
-# The start LSN comes from the dictionary `pgs3 init` wrote at T0. The
-# subscriber's own origin tells pgs3 which of those transactions it already has.
-exec pgs3 serve \
-  --catalog "$STATE/catalog.json" \
-  --wal /var/lib/pgs3/wal \
-  --restore-command 'wal-g --config /etc/wal-g/config.json wal-fetch %f %p' \
-  --listen 0.0.0.0:5439 \
-  --status-file "$STATE/status.json" \
-  --confirmed-lsn-file "$STATE/confirmed.lsn" >> "$LOG" 2>&1
+# Everything else is in the config: the archive, and the replica (`target`)
+# that schema changes are applied to. The start LSN comes from the dictionary
+# `pgs3 init` wrote at T0; the subscriber's own origin tells pgs3 which of
+# those transactions it already has.
+exec pgs3 serve --config /etc/pgs3.yaml >> "$LOG" 2>&1

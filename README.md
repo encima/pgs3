@@ -102,10 +102,12 @@ then repointed at pgs3, which has no network route to the primary, and catches
 up from the wal-g archive alone. Both databases are compared row by row, and
 the dead slot is dropped.
 
-It then makes schema changes with a writer still running: DDL on an
-unpublished table, `ADD COLUMN` plus a backfill in the same transaction, and a
-rewriting `ALTER COLUMN ... TYPE bigint`. pgs3 picks up each new dictionary
-from WAL and keeps streaming: no pause, no restart, no re-capture.
+It then makes schema changes on the primary only, with a writer still
+running: DDL on an unpublished table, `ADD COLUMN` plus a backfill in the same
+transaction, a rewriting `ALTER COLUMN ... TYPE bigint`, a column rename and a
+column drop. pgs3 picks up each new dictionary from WAL, applies the change to
+the replica (its `target`, in `docker/supabase/pgs3.yaml`) between the right
+two transactions, and keeps streaming: no pause, no restart, no re-capture.
 
 ```
 docker compose -f docker/supabase/compose.yaml up --build \
@@ -160,10 +162,46 @@ DDL). DDL on other tables is ignored. Two transactions changing schema
 concurrently, where the later commit's dictionary predates the earlier
 commit, are refused too, since that dictionary may not include both changes.
 
-As with any logical replication, the subscriber needs the DDL too, in the
-right order: added columns there first, dropped columns there last.
-`binary = true` means a column type change must reach both sides with no
-rows of that table in flight.
+#### Applying them to the replica
+
+Give `serve` the replica as `target` (`--target`, or `target:` in the
+`--config` file, next to `source`) and it applies each change there itself:
+
+```yaml
+# pgs3.yaml -- pgs3 serve --config pgs3.yaml
+catalog: /var/lib/pgs3/catalog.json
+wal: /var/lib/pgs3/wal
+restore-command: wal-g wal-fetch %f %p
+source: host=primary dbname=app     # optional for serve: pg_switch_wal() when waiting
+target: host=replica dbname=app     # schema changes are applied here
+```
+
+The DDL is generated from the difference between the two dictionaries, not
+replayed from the primary's SQL (which can carry DML, or anything else that
+must not run twice): added, renamed and dropped columns, type changes
+(`USING col::type`), defaults, NOT NULL, renamed or moved tables and replica
+identity. And it runs at the point in the stream where the change happened.
+pgs3 holds the stream until the subscriber has confirmed every transaction
+before the change, applies what rows in the new shape need (added columns,
+renames, types), sends the transaction, and once that is confirmed applies
+what rows in the old shape would have tripped over (dropped columns,
+tightened NOT NULL). That ordering is what `binary = true` needs for a type
+change, and what a hand-run migration on the replica cannot get exactly
+right under load.
+
+Each phase runs in one transaction on the replica and is recorded there, in
+`pgs3.schema_changes`, in that same transaction, so a reconnect that replays
+the stream never applies a change twice. The statements are idempotent as
+well (`IF [NOT] EXISTS`, or guarded on the replica's catalog). Tables that
+join the publication, and REPLICA IDENTITY USING INDEX, are logged rather
+than applied; tables that leave it, or are dropped, are left alone. Without a
+`target`, every statement is logged for you to run, and `pgs3 decode` prints
+them as `-- replica, before:` / `-- replica, after:` lines. Volatile defaults
+(`now()`, `gen_random_uuid()`) on an added column fill existing rows
+differently on each side, exactly as they would with a hand-run migration.
+
+Note that `init` also reads `target`, to copy the whole schema there with
+pg_dump; `scripts/quickstart.sh --target` adds it to the config after `init`.
 
 The trigger finds the publications to describe by a comment: `pgs3 init`
 sets `COMMENT ON PUBLICATION p IS 'pgs3'` (and refuses to overwrite another
@@ -182,7 +220,7 @@ Input half — done and verified:
 | Values | `numeric` and `jsonb` unpacking, arrays incl. multi-dimensional, empty and null-containing |
 | TOAST | chunk collection and reassembly, including unchanged-value detection |
 | Reorder | per-xid buffering, subtransactions merged at commit, commit ordering, rolled-back xacts and savepoints dropped |
-| Schema changes | follows dictionaries the source writes into WAL with each DDL on a published table, mid-transaction and through savepoints; re-announces changed relations |
+| Schema changes | follows dictionaries the source writes into WAL with each DDL on a published table, mid-transaction and through savepoints; re-announces changed relations; applies the change to the replica (`target`) at its point in the stream |
 | Guard | refuses on DDL against a published relation not followed by a new dictionary, on an archive from another cluster, and on WAL written below `wal_level=logical` |
 
 Output half — done and verified:

@@ -145,6 +145,8 @@ impl Encoder {
                     .i64(*commit_time);
                 out.push(b.0);
             }
+            // Not on the wire: the walsender applies it to the replica.
+            Event::SchemaChange { .. } => {}
             Event::Change { rel, cat, kind, old, new, .. } => {
                 let rel: &Relation = rel;
                 if self.announced.insert(rel.oid, rel) != Some(rel as *const _) {

@@ -66,6 +66,10 @@ pub enum Event<'a> {
         new: Option<Vec<Datum>>,
     },
     Commit { xid: u32, commit_lsn: Lsn, end_lsn: Lsn, commit_time: i64 },
+    /// The transaction committing at `commit_lsn` changed the schema of
+    /// published relations from `old` to `new`. Comes first in its batch,
+    /// ahead of the transaction's own Begin (if it changed any rows).
+    SchemaChange { commit_lsn: Lsn, end_lsn: Lsn, old: &'a Catalog, new: &'a Catalog },
 }
 
 #[derive(Default)]
@@ -422,6 +426,7 @@ impl<'a> ReorderBuffer<'a> {
                         bail!(why);
                     }
                 }
+                let mut out = Vec::new();
                 if let Some((dict_lsn, dict)) = xact.dict {
                     // Two transactions changing schema at once: the one
                     // committing second captured its dictionary before the
@@ -441,11 +446,17 @@ impl<'a> ReorderBuffer<'a> {
                         r.lsn,
                         dict.relations.len()
                     );
+                    out.push(Event::SchemaChange {
+                        commit_lsn: r.lsn,
+                        end_lsn: r.end_lsn,
+                        old: self.cat,
+                        new: dict,
+                    });
                     self.cat = dict;
                     self.cat_since = r.lsn;
                 }
                 if xact.changes.is_empty() {
-                    return Ok(Vec::new());
+                    return Ok(out);
                 }
 
                 // WAL order within a transaction is apply order.
@@ -453,7 +464,7 @@ impl<'a> ReorderBuffer<'a> {
 
                 let (xid, commit_lsn, end_lsn, commit_time) =
                     (r.xid, r.lsn, r.end_lsn, info.xact_time);
-                let mut out = vec![Event::Begin { xid, commit_lsn, commit_time }];
+                out.push(Event::Begin { xid, commit_lsn, commit_time });
                 for c in xact.changes {
                     out.push(Event::Change {
                         lsn: c.lsn,
@@ -530,6 +541,17 @@ pub fn render(e: &Event) -> Option<String> {
     match e {
         Event::Begin { xid, .. } => Some(format!("BEGIN {xid}")),
         Event::Commit { xid, .. } => Some(format!("COMMIT {xid}")),
+        Event::SchemaChange { old, new, .. } => {
+            let p = crate::ddl::plan(old, new);
+            let lines: Vec<String> = p
+                .before
+                .iter()
+                .map(|s| format!("-- replica, before: {s}"))
+                .chain(p.after.iter().map(|s| format!("-- replica, after: {s}")))
+                .chain(p.notes.iter().map(|s| format!("-- note: {s}")))
+                .collect();
+            (!lines.is_empty()).then(|| lines.join("\n"))
+        }
         Event::Change { rel, kind, old, new, .. } => {
             let mut s = format!("table {}: {}:", rel.qualified_name(), kind);
             if let Some(old) = old {

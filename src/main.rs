@@ -1,4 +1,5 @@
 mod catalog;
+mod ddl;
 mod jsonb;
 mod lsn;
 mod numeric;
@@ -71,7 +72,11 @@ options (any of these may also be a key in --config; the command line wins):
                                a new dictionary into WAL with each schema change
                                (without it, DDL on a published table stops serve)
 
-  --target <conninfo>          init: copy the schema here. subscribe: the replica.
+  --target <conninfo>          the replica. init: copy the schema here.
+                               subscribe: create the subscription here.
+                               serve: apply schema changes here, at the point
+                               in the stream where they happened (without it
+                               they are only logged)
   --at <lsn>                   subscribe: the LSN the replica's data is consistent
                                at; everything committed after it is replayed.
                                After pg_upgrade of a copied volume, that is
@@ -318,6 +323,7 @@ fn run() -> Result<()> {
             confirmed_file: o.get("confirmed-lsn-file").map(Into::into),
             exit_when_caught_up: o.flag("exit-when-caught-up"),
             status_file: o.get("status-file").map(Into::into),
+            target: o.get("target"),
         };
         let addr = o.get("listen").unwrap_or_else(|| DEFAULT_LISTEN.into());
         return walsender::serve(&addr, cat, opts);

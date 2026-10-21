@@ -93,12 +93,18 @@ from (
                'attisdropped', a.attisdropped,
                'attispkey',  coalesce(k.iskey, false),
                'attgenerated', a.attgenerated,
-               'typname',    t.typname,
-               'typnsp',     tn.nspname
+               -- A dropped column's type is gone (atttypid 0), but its
+               -- attlen/attalign still lay out the tuples written before.
+               'typname',    coalesce(t.typname, '-'),
+               'typnsp',     coalesce(tn.nspname, '-'),
+               -- For applying schema changes on the replica.
+               'typdef',     format_type(a.atttypid, a.atttypmod),
+               'default',    pg_get_expr(ad.adbin, ad.adrelid)
              ) order by a.attnum), '[]'::json)
       from pg_attribute a
-      join pg_type t  on t.oid = a.atttypid
-      join pg_namespace tn on tn.oid = t.typnamespace
+      left join pg_type t  on t.oid = a.atttypid
+      left join pg_namespace tn on tn.oid = t.typnamespace
+      left join pg_attrdef ad on ad.adrelid = a.attrelid and ad.adnum = a.attnum
       left join lateral (
         select true as iskey
         from pg_index i

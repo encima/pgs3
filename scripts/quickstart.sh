@@ -9,6 +9,8 @@
 #                                 'wal-g wal-fetch %f %p'
 #                            (or set PGS3_WALG_CONFIG to use wal-g's config)
 #   --publication <name>     default p; created FOR ALL TABLES if missing
+#   --target <conninfo>      the replica: serve applies schema changes there
+#                            as they happen on the primary
 #   --port <n>               listen port, default 5439
 #   --listen <addr:port>     listen address, default 127.0.0.1:<port>
 #   --dir <path>             state directory, default ./pgs3-state
@@ -23,11 +25,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 DIR="${PGS3_DIR:-$PWD/pgs3-state}"
-SOURCE="" PUBLICATION="p" PORT=5439 LISTEN="" RESTORE="${PGS3_RESTORE_COMMAND:-}" REINIT="" STOP=""
+SOURCE="" TARGET="" PUBLICATION="p" PORT=5439 LISTEN="" RESTORE="${PGS3_RESTORE_COMMAND:-}" REINIT="" STOP=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --restore-command|--restore-cmd) RESTORE="$2"; shift 2 ;;
     --publication)     PUBLICATION="$2"; shift 2 ;;
+    --target)          TARGET="$2"; shift 2 ;;
     --port)            PORT="$2"; shift 2 ;;
     --listen)          LISTEN="$2"; shift 2 ;;
     --dir)             DIR="$2"; shift 2 ;;
@@ -96,6 +99,10 @@ else
   "$PGS3" init --config "$CONFIG" 2>&1 | sed 's/^/    /'
 fi
 
+# After init, which would otherwise copy the whole schema to a `target`: here
+# the replica gets its data from a snapshot, and serve only needs it for DDL.
+[ -n "$TARGET" ] && ! grep -q '^target:' "$CONFIG" && echo "target: $(yq "$TARGET")" >> "$CONFIG"
+
 echo "==> checking the archive"
 "$PGS3" check --config "$CONFIG" 2>&1 | sed 's/^/    /'
 
@@ -117,7 +124,7 @@ Once the replica holds the data as of some LSN X >= $START (restored from a
 snapshot taken after this point, or pg_upgraded from one), subscribe it with:
 
   $PGS3 subscribe --config $CONFIG \\
-      --target 'host=<replica> dbname=<db>' --at <X>
+      --target '${TARGET:-host=<replica> dbname=<db>}' --at <X>
 
 That creates no slot on the primary. Then watch:
 

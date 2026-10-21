@@ -34,6 +34,13 @@ pub struct Column {
     pub attgenerated: String,
     pub typname: String,
     pub typnsp: String,
+    /// `format_type(atttypid, atttypmod)`, e.g. `numeric(12,2)`, for DDL on
+    /// the replica. Absent in dictionaries captured before it was recorded.
+    #[serde(default)]
+    pub typdef: Option<String>,
+    /// The column default, or for a generated column its expression.
+    #[serde(default, rename = "default")]
+    pub default_expr: Option<String>,
 }
 
 #[allow(dead_code)]

@@ -103,8 +103,11 @@ services:
       context: ../..
       dockerfile: docker/supabase/Dockerfile
     image: pgs3-supabase
+    environment:
+      PGPASSWORD: postgres
     volumes:
       - ./walg.json:/etc/wal-g/config.json:ro
+      - ./pgs3.yaml:/etc/pgs3.yaml:ro
       - state:/state
     # Only `downstream`: no route to the primary. What it serves can only have
     # come out of the bucket.
