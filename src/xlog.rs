@@ -37,6 +37,7 @@ pub const RM_XLOG_ID: u8 = 0;
 pub const RM_XACT_ID: u8 = 1;
 pub const RM_HEAP2_ID: u8 = 9;
 pub const RM_HEAP_ID: u8 = 10;
+pub const RM_LOGICALMSG_ID: u8 = 21;
 
 pub const MAIN_FORKNUM: u8 = 0;
 
@@ -76,6 +77,9 @@ pub struct Record {
     pub info: u8,
     pub main_data: Vec<u8>,
     pub blocks: Vec<BlockRef>,
+    /// The top-level transaction of a subtransaction, logged on the
+    /// subtransaction's first record (PG14+, wal_level=logical).
+    pub top_xid: Option<u32>,
 }
 
 impl Record {
@@ -600,7 +604,7 @@ impl WalReader {
         ensure!(computed == crc, "CRC mismatch at {start}: got {computed:#x}, want {crc:#x}");
 
         let end_lsn = Lsn(maxalign(self.pos.0));
-        let (main_data, blocks) = parse_record_body(&body, start, self.version)?;
+        let (main_data, blocks, top_xid) = parse_record_body(&body, start, self.version)?;
 
         // After a switch the remainder of the segment is zero padding. Jump to
         // the next segment rather than trying to parse it.
@@ -609,7 +613,17 @@ impl WalReader {
             self.pos = Lsn((segno + 1) * self.seg_size);
         }
 
-        Ok(Some(Record { lsn: start, end_lsn, tot_len: tot_len as u32, xid, rmid, info, main_data, blocks }))
+        Ok(Some(Record {
+            lsn: start,
+            end_lsn,
+            tot_len: tot_len as u32,
+            xid,
+            rmid,
+            info,
+            main_data,
+            blocks,
+            top_xid,
+        }))
     }
 }
 
@@ -620,7 +634,7 @@ fn parse_record_body(
     body: &[u8],
     lsn: Lsn,
     version: PgVersion,
-) -> Result<(Vec<u8>, Vec<BlockRef>)> {
+) -> Result<(Vec<u8>, Vec<BlockRef>, Option<u32>)> {
     struct Pending {
         id: u8,
         fork_flags: u8,
@@ -631,7 +645,7 @@ fn parse_record_body(
 
     // Records such as XLOG_SWITCH have no block references and no main data.
     if body.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), None));
     }
 
     let mut p = 0usize;
@@ -644,6 +658,7 @@ fn parse_record_body(
     // FPI_FOR_HINT, for one) omits that header entirely, and looking for it
     // reads straight into the block image.
     let mut datatotal: usize = 0;
+    let mut top_xid = None;
 
     macro_rules! take {
         ($n:expr) => {{
@@ -670,7 +685,7 @@ fn parse_record_body(
                 let _origin = u16::from_le_bytes(take!(2).try_into()?);
             }
             XLR_BLOCK_ID_TOPLEVEL_XID => {
-                take!(4);
+                top_xid = Some(u32::from_le_bytes(take!(4).try_into()?));
             }
             id if id <= XLR_MAX_BLOCK_ID => {
                 let h = take!(3);
@@ -736,7 +751,7 @@ fn parse_record_body(
         });
     }
     let main_data = take!(main_len).to_vec();
-    Ok((main_data, blocks))
+    Ok((main_data, blocks, top_xid))
 }
 
 

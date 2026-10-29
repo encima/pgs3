@@ -44,6 +44,9 @@ pub struct Options {
     /// Where to periodically write a JSON status snapshot for external
     /// monitoring (healthchecks, systemd, k8s probes).
     pub status_file: Option<PathBuf>,
+    /// The replica's conninfo. When set, schema changes are applied to it at
+    /// the right point in the stream; otherwise they are only logged.
+    pub target: Option<String>,
 }
 
 struct Conn {
@@ -439,7 +442,7 @@ fn stream(conn: &mut Conn, sql: &str, cat: &Catalog, opts: &Options) -> Result<b
     }
     let mut rb = ReorderBuffer::new(cat);
     rb.strict_ddl = opts.strict_ddl;
-    let mut enc = Encoder::new(cat);
+    let mut enc = Encoder::new();
 
     // Only commit boundaries count as progress: the subscriber's flush LSN
     // advances to a transaction's end_lsn once it has applied it, never to a
@@ -449,29 +452,15 @@ fn stream(conn: &mut Conn, sql: &str, cat: &Catalog, opts: &Options) -> Result<b
     let mut confirmed = Lsn(0);
     let mut idle_since: Option<Instant> = None;
     let mut sent_msgs = 0u64;
+    let mut sent_commits = 0u64;
     let mut announced_drain = false;
 
     let mut last_status = Instant::now();
     loop {
         // Client feedback first: it drives both the confirmed-LSN file and the
         // decision to stop.
-        while let Some((tag, body)) = conn.poll_message()? {
-            match tag {
-                b'd' if body.first() == Some(&b'r') && body.len() >= 34 => {
-                    // StandbyStatusUpdate: write, flush, apply, clock, replyRequested
-                    let flush = Lsn(u64::from_be_bytes(body[9..17].try_into()?));
-                    if flush > confirmed {
-                        confirmed = flush;
-                        publish_confirmed(opts, confirmed)?;
-                    }
-                    if body[33] == 1 {
-                        keepalive(conn, last_commit_end, false)?;
-                    }
-                }
-                b'd' => {} // hot-standby feedback and friends: nothing to do
-                b'c' | b'X' => return Ok(false),
-                _ => {}
-            }
+        if !read_feedback(conn, opts, &mut confirmed, last_commit_end)? {
+            return Ok(false);
         }
 
         {
@@ -480,24 +469,67 @@ fn stream(conn: &mut Conn, sql: &str, cat: &Catalog, opts: &Options) -> Result<b
                     // feed() returns a whole transaction at once, at its commit,
                     // so the already-applied ones can be dropped as a unit.
                     let batch = rb.feed(&rec)?;
-                    let applied_already = batch.iter().any(|e| {
-                        matches!(e, Event::Commit { end_lsn, .. } if *end_lsn <= resume)
-                    });
-                    if applied_already {
-                        if let Some(Event::Commit { end_lsn, .. }) = batch.last() {
-                            last_commit_end = last_commit_end.max(*end_lsn);
+                    let batch_end = batch.iter().find_map(|e| match e {
+                        Event::Commit { end_lsn, .. } | Event::SchemaChange { end_lsn, .. } => {
+                            Some(*end_lsn)
                         }
+                        _ => None,
+                    });
+                    // Its schema change included: the replica has that too.
+                    if batch_end.is_some_and(|end| end <= resume) {
+                        last_commit_end = last_commit_end.max(batch_end.unwrap());
                         continue;
                     }
+                    let mut after: Option<(Lsn, Vec<String>)> = None;
                     for ev in batch {
+                        if let Event::SchemaChange { commit_lsn, end_lsn, old, new } = &ev {
+                            let plan = crate::ddl::plan(old, new);
+                            for n in &plan.notes {
+                                eprintln!("pgs3: schema change at {commit_lsn}: {n}");
+                            }
+                            let Some(target) = &opts.target else {
+                                for stmt in plan.before.iter().chain(&plan.after) {
+                                    eprintln!(
+                                        "pgs3: schema change at {commit_lsn}; apply on the replica: {stmt}"
+                                    );
+                                }
+                                continue;
+                            };
+                            // Rows in the new shape must not reach the replica
+                            // before it can take them, nor the change before
+                            // the rows in the old shape ahead of it.
+                            if !plan.before.is_empty() {
+                                if sent_commits > 0
+                                    && !wait_confirmed(conn, opts, &mut confirmed, last_commit_end)?
+                                {
+                                    return Ok(false);
+                                }
+                                apply_on_target(target, &plan.before, *commit_lsn, "before")?;
+                            }
+                            after = Some((*commit_lsn, plan.after));
+                            last_commit_end = last_commit_end.max(*end_lsn);
+                            continue;
+                        }
                         let at = event_lsn(&ev);
                         if let Event::Commit { end_lsn, .. } = &ev {
                             last_commit_end = *end_lsn;
+                            sent_commits += 1;
                         }
                         for msg in enc.encode(&ev)? {
                             xlog_data(conn, at, last_commit_end.max(at), &msg)?;
                             sent_msgs += 1;
                         }
+                    }
+                    // What rows in the old shape would trip over waits until
+                    // the transaction that made the change is applied.
+                    if let Some((at, after)) = after.filter(|(_, a)| !a.is_empty()) {
+                        if sent_commits > 0
+                            && !wait_confirmed(conn, opts, &mut confirmed, last_commit_end)?
+                        {
+                            return Ok(false);
+                        }
+                        let target = opts.target.as_deref().expect("plans are only kept with a target");
+                        apply_on_target(target, &after, at, "after")?;
                     }
                     continue;
                 }
@@ -546,9 +578,97 @@ fn stream(conn: &mut Conn, sql: &str, cat: &Catalog, opts: &Options) -> Result<b
     }
 }
 
+/// Read whatever feedback the subscriber has sent. False once it has closed
+/// the stream.
+fn read_feedback(conn: &mut Conn, opts: &Options, confirmed: &mut Lsn, wal_end: Lsn) -> Result<bool> {
+    while let Some((tag, body)) = conn.poll_message()? {
+        match tag {
+            b'd' if body.first() == Some(&b'r') && body.len() >= 34 => {
+                // StandbyStatusUpdate: write, flush, apply, clock, replyRequested
+                let flush = Lsn(u64::from_be_bytes(body[9..17].try_into()?));
+                if flush > *confirmed {
+                    *confirmed = flush;
+                    publish_confirmed(opts, *confirmed)?;
+                }
+                if body[33] == 1 {
+                    keepalive(conn, wal_end, false)?;
+                }
+            }
+            b'd' => {} // hot-standby feedback and friends: nothing to do
+            b'c' | b'X' => return Ok(false),
+            _ => {}
+        }
+    }
+    Ok(true)
+}
+
+/// Hold the stream until the subscriber has applied everything up to `upto`.
+/// False if it closed the stream meanwhile.
+fn wait_confirmed(conn: &mut Conn, opts: &Options, confirmed: &mut Lsn, upto: Lsn) -> Result<bool> {
+    conn.flush()?;
+    let started = Instant::now();
+    let mut asked: Option<Instant> = None;
+    let mut announced = false;
+    while *confirmed < upto {
+        if !read_feedback(conn, opts, confirmed, upto)? {
+            return Ok(false);
+        }
+        if asked.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+            keepalive(conn, upto, true)?;
+            asked = Some(Instant::now());
+        }
+        if !announced && started.elapsed() > Duration::from_secs(10) {
+            announced = true;
+            eprintln!(
+                "pgs3: waiting for the subscriber to confirm {upto} (at {confirmed}) before \
+                 changing its schema"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(true)
+}
+
+/// Apply one phase of a schema change to the replica, all or nothing, and
+/// at most once: `pgs3.schema_changes` on the replica records it in the same
+/// transaction, because a reconnect replays the stream from the subscriber's
+/// last commit and would otherwise apply it again -- possibly against a table
+/// a later change has since renamed.
+fn apply_on_target(target: &str, stmts: &[String], at: Lsn, phase: &str) -> Result<()> {
+    let vars = [("lsn", at.to_string()), ("phase", phase.to_string())];
+    let vars: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let done = crate::psql(
+        target,
+        &vars,
+        "create schema if not exists pgs3;\n\
+         create table if not exists pgs3.schema_changes (\n\
+           lsn pg_lsn, phase text, applied_at timestamptz not null default now(),\n\
+           statements text[] not null, primary key (lsn, phase));\n\
+         select count(*) from pgs3.schema_changes where lsn = :'lsn' and phase = :'phase';",
+        "checking the target's applied schema changes",
+    )?;
+    if String::from_utf8_lossy(&done).trim() != "0" {
+        return Ok(());
+    }
+    let sql = format!(
+        "begin;\n{};\n\
+         insert into pgs3.schema_changes (lsn, phase, statements) values (:'lsn', :'phase', array[{}]);\n\
+         commit;\n",
+        stmts.join(";\n"),
+        stmts.iter().map(|s| format!("'{}'", s.replace('\'', "''"))).collect::<Vec<_>>().join(", ")
+    );
+    crate::psql(target, &vars, &sql, "applying a schema change to the target")
+        .with_context(|| format!("schema change at {at}"))?;
+    for s in stmts {
+        eprintln!("pgs3: schema change at {at}, applied to the target ({phase}): {s}");
+    }
+    Ok(())
+}
+
 /// Where in WAL this message's change lives. Used as the XLogData start LSN.
 fn event_lsn(e: &Event) -> Lsn {
     match e {
+        Event::SchemaChange { commit_lsn, .. } => *commit_lsn,
         Event::Begin { commit_lsn, .. } => *commit_lsn,
         Event::Commit { end_lsn, .. } => *end_lsn,
         Event::Change { lsn, .. } => *lsn,

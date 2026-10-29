@@ -1,0 +1,11 @@
+# pgs3 serve's config for the demo; any key is also a --flag.
+catalog: /state/catalog.json
+wal: /var/lib/pgs3/wal
+restore-command: wal-g --config /etc/wal-g/config.json wal-fetch %f %p
+listen: 0.0.0.0:5439
+status-file: /state/status.json
+confirmed-lsn-file: /state/confirmed.lsn
+# The replica. Schema changes on the primary are applied here, at the point in
+# the stream where they happened. (The password comes from PGPASSWORD.) There
+# is no `source`: pgs3 has no route to the primary in this demo.
+target: host=replica user=supabase_admin dbname=postgres

@@ -14,7 +14,7 @@ use crate::catalog::{Catalog, Column, Relation};
 use crate::reorder::{Event, Kind};
 use crate::tuple::Datum;
 use anyhow::{bail, ensure, Context, Result};
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 /// Types whose `send()` output we can produce from the on-disk bytes.
 /// Everything else is rejected when the stream starts, not mid-transaction.
@@ -114,16 +114,17 @@ impl Buf {
     }
 }
 
-pub struct Encoder<'a> {
-    cat: &'a Catalog,
-    /// Relations already described to this subscriber. The catalog is frozen,
-    /// so a relation never needs re-sending once announced.
-    announced: HashSet<u32>,
+#[derive(Default)]
+pub struct Encoder {
+    /// The definition each relation was last described to this subscriber
+    /// with. A schema change brings a new dictionary and so a new definition,
+    /// which is announced again before its first row, as Postgres does.
+    announced: HashMap<u32, *const Relation>,
 }
 
-impl<'a> Encoder<'a> {
-    pub fn new(cat: &'a Catalog) -> Encoder<'a> {
-        Encoder { cat, announced: HashSet::new() }
+impl Encoder {
+    pub fn new() -> Encoder {
+        Encoder::default()
     }
 
     /// Encode one event, possibly preceded by a Relation message.
@@ -144,8 +145,19 @@ impl<'a> Encoder<'a> {
                     .i64(*commit_time);
                 out.push(b.0);
             }
-            Event::Change { rel, kind, old, new, .. } => {
-                if self.announced.insert(rel.oid) {
+            // Not on the wire: the walsender applies it to the replica.
+            Event::SchemaChange { .. } => {}
+            Event::Change { rel, cat, kind, old, new, .. } => {
+                let rel: &Relation = rel;
+                if self.announced.insert(rel.oid, rel) != Some(rel as *const _) {
+                    // A changed definition can bring a column type we cannot
+                    // send; refuse before the subscriber sees any of it.
+                    for c in columns(rel) {
+                        if let Err(why) = encodable(cat, c.atttypid) {
+                            self.announced.remove(&rel.oid);
+                            bail!("{}.{} is {} ({why})", rel.qualified_name(), c.attname, c.typname);
+                        }
+                    }
                     out.push(relation_message(rel));
                 }
                 let mut b = Buf::default();
@@ -153,7 +165,7 @@ impl<'a> Encoder<'a> {
                     Kind::Insert => {
                         let new = new.as_ref().expect("INSERT always carries a new tuple");
                         b.u8(b'I').i32(rel.oid as i32).u8(b'N');
-                        b.bytes(&tuple_data(self.cat, rel, new)?);
+                        b.bytes(&tuple_data(cat, rel, new)?);
                     }
                     Kind::Update => {
                         let new = new.as_ref().expect("UPDATE always carries a new tuple");
@@ -162,10 +174,10 @@ impl<'a> Encoder<'a> {
                             // 'O' is a whole old tuple (REPLICA IDENTITY FULL),
                             // 'K' is just the identity key.
                             b.u8(if rel.relreplident == 'f' { b'O' } else { b'K' });
-                            b.bytes(&tuple_data(self.cat, rel, old)?);
+                            b.bytes(&tuple_data(cat, rel, old)?);
                         }
                         b.u8(b'N');
-                        b.bytes(&tuple_data(self.cat, rel, new)?);
+                        b.bytes(&tuple_data(cat, rel, new)?);
                     }
                     Kind::Delete => {
                         let old = match old {
@@ -178,7 +190,7 @@ impl<'a> Encoder<'a> {
                         };
                         b.u8(b'D').i32(rel.oid as i32);
                         b.u8(if rel.relreplident == 'f' { b'O' } else { b'K' });
-                        b.bytes(&tuple_data(self.cat, rel, old)?);
+                        b.bytes(&tuple_data(cat, rel, old)?);
                     }
                 }
                 out.push(b.0);
